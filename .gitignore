@@ -12,3 +12,4 @@ tasks.db
 output/*.json
 output/*.xlsx
 snapshots/*.json
+*.xlsx
