@@ -34,6 +34,7 @@ def build_cell_graph(
                 data_type=cd.data_type,
                 is_merged=cd.is_merged,
                 merge_parent_id=cd.merge_parent_id,
+                number_format=cd.number_format,
             )
             graph.add_cell(cell)
 

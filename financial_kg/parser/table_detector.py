@@ -25,8 +25,14 @@ _NOTES_KEYWORDS = {"备注", "说明", "注", "取值说明", "参数释义"}
 
 
 def _is_excel_date_serial(v) -> bool:
-    """Heuristic: integer in range of plausible Excel date serials (2000-2100)."""
-    if not isinstance(v, (int, float)):
+    """Heuristic: integer in range of plausible Excel date serials (2000-2100).
+
+    Must be a whole number — real date serials have no fractional part.
+    Fractional values (e.g. 44590.14) are financial data, not dates.
+    """
+    if not isinstance(v, (int, float)) or isinstance(v, bool):
+        return False
+    if v != int(v):  # fractional → not a date serial
         return False
     return 36526 <= v <= 73050  # 2000-01-01 to 2099-12-31
 
@@ -71,11 +77,13 @@ class ColRole:
 class TableInfo:
     """Detected table within a sheet."""
 
-    def __init__(self, sheet: str, header_row: int, data_start: int, data_end: int):
+    def __init__(self, sheet: str, header_row: int, data_start: int, data_end: int,
+                 title: Optional[str] = None):
         self.sheet = sheet
         self.header_row = header_row
         self.data_start = data_start
         self.data_end = data_end
+        self.title = title  # sub-table title from the row above the header, e.g. "成本费用表-资本金"
         # col_letter -> ColRole string
         self.col_roles: dict[str, str] = {}
         # col_letter -> header label
@@ -152,14 +160,41 @@ def detect_tables(
         data_start = hrow + 1
         # data ends just before the next header row (or at last row)
         if i + 1 < len(header_rows):
-            data_end = header_rows[i + 1] - 1
+            next_hrow = header_rows[i + 1]
+            # The row just before the next header is often a sub-table title row
+            # (a single-cell string label like "成本费用表-全投资").
+            # Walk backwards from next_hrow-1 to find the true last data row.
+            data_end = next_hrow - 1
+            while data_end >= data_start:
+                candidate = rows.get(data_end, {})
+                vals = [v for v in candidate.values() if v is not None]
+                str_vals = [v for v in vals if isinstance(v, str) and v.strip()]
+                # A title row: only 1 non-empty cell and it's a string (no numbers)
+                num_vals = [v for v in vals if isinstance(v, (int, float)) and not isinstance(v, bool)]
+                if len(vals) <= 2 and len(str_vals) >= 1 and len(num_vals) == 0:
+                    data_end -= 1  # skip this title/blank row
+                elif not vals:
+                    data_end -= 1  # skip empty row
+                else:
+                    break
         else:
             data_end = sorted_row_nums[-1]
 
         if data_start > data_end:
             continue
 
-        tbl = TableInfo(sheet_name, hrow, data_start, data_end)
+        # Extract sub-table title: look for a single-string row just above header
+        title: Optional[str] = None
+        for title_row_num in range(hrow - 1, max(hrow - 4, 0), -1):
+            candidate = rows.get(title_row_num, {})
+            vals = [v for v in candidate.values() if v is not None]
+            str_vals = [v for v in vals if isinstance(v, str) and v.strip()]
+            num_vals = [v for v in vals if isinstance(v, (int, float)) and not isinstance(v, bool)]
+            if len(vals) >= 1 and len(str_vals) >= 1 and len(num_vals) == 0:
+                title = str_vals[0]
+                break
+
+        tbl = TableInfo(sheet_name, hrow, data_start, data_end, title=title)
         _classify_columns(tbl, rows)
         tables.append(tbl)
 
@@ -191,10 +226,13 @@ def _find_header_rows(
 
     Two cases qualify as a header row:
     1. Text header: < 20% numeric values AND keywords from ≥ 2 distinct categories.
-    2. Time-series header: > 50% date serials AND at least 1 keyword category
-       (the text columns label the row as a header, date serials label time periods).
+    2. Time-series header: > 50% year/date-serial values AND at least 1 keyword category,
+       AND the row must be within the first 15 rows of the sheet (prevents data rows
+       with large financial values from being misidentified as date-serial headers).
     """
     header_rows = []
+    first_row = sorted_row_nums[0] if sorted_row_nums else 0
+
     for rnum in sorted_row_nums:
         row = rows[rnum]
         if not row:
@@ -216,10 +254,13 @@ def _find_header_rows(
 
         kw_cats = _keyword_categories(str_values)
 
-        # Require ≥ 3 distinct keyword categories to avoid false positives
-        # (data cells often contain 1-2 keyword substrings by coincidence)
         is_text_header = num_ratio < 0.2 and len(kw_cats) >= 3
-        is_ts_header = date_ratio > 0.5 and len(kw_cats) >= 1
+        # Time-series headers only valid in the first 15 rows of the sheet
+        is_ts_header = (
+            date_ratio > 0.5
+            and len(kw_cats) >= 1
+            and (rnum - first_row) < 15
+        )
 
         if is_text_header or is_ts_header:
             header_rows.append(rnum)

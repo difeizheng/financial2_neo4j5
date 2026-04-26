@@ -14,6 +14,7 @@ class CellData:
     data_type: str    # "number" | "string" | "date" | "bool" | "formula" | "empty"
     is_merged: bool = False
     merge_parent_id: Optional[str] = None  # id of the top-left cell in merge group
+    number_format: Optional[str] = None    # Excel number format string, e.g. 'yyyy"年"m"月"'
 
     @property
     def id(self) -> str:
@@ -33,6 +34,7 @@ class Cell:
     is_header: bool = False
     is_merged: bool = False
     merge_parent_id: Optional[str] = None
+    number_format: Optional[str] = None    # Excel number format string
     # Populated after graph construction
     dependencies: list[str] = field(default_factory=list)   # cell ids this cell depends on
     dependents: list[str] = field(default_factory=list)     # cell ids that depend on this cell
@@ -52,6 +54,7 @@ class Cell:
             "is_header": self.is_header,
             "is_merged": self.is_merged,
             "merge_parent_id": self.merge_parent_id,
+            "number_format": self.number_format,
             "dependencies": self.dependencies,
             "dependents": self.dependents,
             "indicator_id": self.indicator_id,
@@ -60,4 +63,5 @@ class Cell:
 
     @classmethod
     def from_dict(cls, d: dict) -> "Cell":
+        d = {**d, "number_format": d.get("number_format")}
         return cls(**d)

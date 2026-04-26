@@ -28,7 +28,7 @@ _COLORS = {
 def build_indicator_graph(
     graph: FinancialGraph,
     sheet_filter: Optional[str] = None,
-    max_nodes: int = 300,
+    max_nodes: int = 500,
     output_path: Optional[str] = None,
 ) -> str:
     """Build a pyvis HTML showing Indicator + Table layers.
@@ -75,7 +75,9 @@ def build_indicator_graph(
         if node_count >= max_nodes:
             break
         label = ind.name[:18] if ind.name else ind_id[-20:]
-        val_str = f"{ind.summary_value:.2f}" if isinstance(ind.summary_value, float) else str(ind.summary_value or "")
+        val_str = ind.display_value if ind.display_value is not None else (
+            f"{ind.summary_value:.2f}" if isinstance(ind.summary_value, float) else str(ind.summary_value or "")
+        )
         unit_str = f" {ind.unit}" if ind.unit else ""
         net.add_node(
             ind_id,

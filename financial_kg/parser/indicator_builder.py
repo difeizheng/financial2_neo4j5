@@ -13,7 +13,8 @@ from openpyxl.utils import column_index_from_string
 from ..models.cell import CellData
 from ..models.indicator import Indicator
 from ..models.graph import FinancialGraph
-from .table_detector import TableInfo, ColRole, detect_tables
+from .table_detector import TableInfo, ColRole, detect_tables, _is_excel_date_serial
+from .format_utils import format_cell_value, serial_to_label
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -111,7 +112,18 @@ def _process_table(
         # ── Extract name ─────────────────────────────────────────────────────
         name = ""
         if name_col and name_col in row:
-            name = _safe_str(row[name_col])
+            raw_name_val = row[name_col]
+            # If the name cell contains a date serial, format it using number_format
+            name_cd = cd_lookup.get((row_num, name_col))
+            name_fmt = name_cd.number_format if name_cd else None
+            formatted = format_cell_value(raw_name_val, name_fmt)
+            if formatted:
+                name = formatted
+            elif _is_excel_date_serial(raw_name_val):
+                # Fallback: no number_format but value looks like a date serial
+                name = serial_to_label(raw_name_val)
+            else:
+                name = _safe_str(raw_name_val)
         # Fallback: first string value in the row
         if not name:
             for col in sorted(row.keys(), key=lambda c: column_index_from_string(c)):
@@ -168,8 +180,13 @@ def _process_table(
 
         # ── Get formula from value cell ──────────────────────────────────────
         formula_raw: Optional[str] = None
+        value_cell_fmt: Optional[str] = None
         if value_cell_id and value_cell_id in graph.cells:
             formula_raw = graph.cells[value_cell_id].formula_raw
+            value_cell_fmt = graph.cells[value_cell_id].number_format
+
+        # ── Compute display_value from number_format ─────────────────────────
+        display_value = format_cell_value(summary_value, value_cell_fmt)
 
         # ── Create Indicator ─────────────────────────────────────────────────
         ind_id = _make_indicator_id(sheet_name, row_num, name, category)
@@ -181,6 +198,7 @@ def _process_table(
             category=category or None,
             unit=unit,
             summary_value=summary_value,
+            display_value=display_value,
             formula_readable=formula_raw,  # will be humanized in Phase 5
             time_series=time_series,
             cell_ids=cell_ids,
@@ -210,7 +228,7 @@ def _process_table(
 
     table = Table(
         id=table_id,
-        name=sheet_name,
+        name=tbl.title or sheet_name,
         sheet=sheet_name,
         table_type=table_type,
         header_rows=[tbl.header_row],

@@ -18,7 +18,8 @@ class Indicator:
     subcategory: Optional[str] = None
     unit: Optional[str] = None       # e.g. "万元"
     description: Optional[str] = None  # LLM-generated business description
-    summary_value: Any = None        # total / summary value
+    summary_value: Any = None        # total / summary value (raw)
+    display_value: Optional[str] = None  # formatted display string (e.g. "2023年12月")
     formula_readable: Optional[str] = None  # human-readable formula
     time_series: dict = field(default_factory=dict)  # {period_label: value}
     cell_ids: list[str] = field(default_factory=list)
@@ -39,6 +40,7 @@ class Indicator:
             "unit": self.unit,
             "description": self.description,
             "summary_value": self.summary_value,
+            "display_value": self.display_value,
             "formula_readable": self.formula_readable,
             "time_series": self.time_series,
             "cell_ids": self.cell_ids,
@@ -50,4 +52,5 @@ class Indicator:
 
     @classmethod
     def from_dict(cls, d: dict) -> "Indicator":
+        d = {**d, "display_value": d.get("display_value")}
         return cls(**d)

@@ -97,6 +97,7 @@ def read_excel(filepath: str) -> dict[str, list[CellData]]:
                     data_type=data_type,
                     is_merged=is_merged,
                     merge_parent_id=merge_parent_id,
+                    number_format=cell_f.number_format or None,
                 ))
 
         result[sheet_name] = cells

@@ -39,7 +39,9 @@ st.sidebar.header("筛选")
 sheets = sorted({c.sheet for c in graph.cells.values()})
 sheet_filter = st.sidebar.selectbox("Sheet", ["全部"] + sheets)
 view_mode = st.sidebar.radio("视图", ["Indicator/Table 层", "Cell 依赖子图"])
-max_nodes = st.sidebar.slider("最大节点数", 50, 500, 200, 50)
+max_nodes = st.sidebar.slider("最大节点数", 50, 5000, 500, 50)
+if max_nodes > 2000:
+    st.sidebar.warning("节点数超过 2000，浏览器渲染可能较慢")
 
 sheet_arg = None if sheet_filter == "全部" else sheet_filter
 
@@ -56,13 +58,13 @@ if view_mode == "Indicator/Table 层":
     st.subheader("Indicator 列表")
     inds = [i for i in graph.indicators.values() if not sheet_arg or i.sheet == sheet_arg]
     rows = []
-    for ind in inds[:500]:
+    for ind in inds[:5000]:
         rows.append({
             "ID": ind.id,
             "名称": ind.name,
             "分类": ind.category or "",
             "单位": ind.unit or "",
-            "汇总值": ind.summary_value,
+            "汇总值": ind.display_value if ind.display_value is not None else ind.summary_value,
             "Sheet": ind.sheet,
             "时间序列点数": len(ind.time_series),
         })
