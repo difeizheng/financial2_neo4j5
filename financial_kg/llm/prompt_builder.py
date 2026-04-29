@@ -25,7 +25,8 @@ class PromptBuilder:
             f"- Table层：{stats['total_tables']}个财务报表"
         )
 
-        context_section = self._format_contexts(retrieval_result.contexts)
+        query_years = getattr(retrieval_result, "query_years", [])
+        context_section = self._format_contexts(retrieval_result.contexts, query_years)
 
         return (
             "你是一个专业的财务分析助手，基于财务模型知识图谱回答用户问题。\n\n"
@@ -45,15 +46,15 @@ class PromptBuilder:
             "4. 数值请保留合理精度，注明单位"
         )
 
-    def _format_contexts(self, contexts: list[IndicatorContext]) -> str:
+    def _format_contexts(self, contexts: list[IndicatorContext], query_years: list[str] | None = None) -> str:
         if not contexts:
             return "（未找到相关指标）"
         lines = []
         for ctx in contexts:
-            lines.append(self.format_indicator_context(ctx))
+            lines.append(self.format_indicator_context(ctx, query_years))
         return "\n\n".join(lines)
 
-    def format_indicator_context(self, ctx: IndicatorContext) -> str:
+    def format_indicator_context(self, ctx: IndicatorContext, query_years: list[str] | None = None) -> str:
         ind = ctx.indicator
         parts = [f"**{ind.name}**（{ind.category or ''}）"]
         if ind.unit:
@@ -61,10 +62,33 @@ class PromptBuilder:
         if ind.summary_value is not None:
             parts.append(f"  汇总值: {ind.summary_value}")
         if ind.time_series:
-            ts_items = list(ind.time_series.items())[:8]
-            ts_str = ", ".join(f"{p}={v}" for p, v in ts_items)
-            if len(ind.time_series) > 8:
-                ts_str += f"... (共{len(ind.time_series)}期)"
+            ts_items = list(ind.time_series.items())
+            if query_years:
+                # Show direct hits for queried years prominently
+                direct_hits = [(k, v) for k, v in ts_items if any(y in str(k) for y in query_years)]
+                if direct_hits:
+                    parts.append("  查询年份数据: " + ", ".join(f"{k}={v}" for k, v in direct_hits))
+                # Smart window: first 3 + queried year neighbors + last 2
+                shown: set[int] = set(range(min(3, len(ts_items))))
+                shown.update(range(max(0, len(ts_items) - 2), len(ts_items)))
+                for idx, (k, _) in enumerate(ts_items):
+                    if any(y in str(k) for y in query_years):
+                        shown.update(range(max(0, idx - 1), min(len(ts_items), idx + 2)))
+                sorted_idx = sorted(shown)
+                display_parts: list[str] = []
+                for i, idx in enumerate(sorted_idx):
+                    if i > 0 and sorted_idx[i] - sorted_idx[i - 1] > 1:
+                        display_parts.append("...")
+                    k, v = ts_items[idx]
+                    display_parts.append(f"{k}={v}")
+                ts_str = ", ".join(display_parts)
+                if len(ts_items) > len(shown):
+                    ts_str += f" (共{len(ts_items)}期)"
+            else:
+                display = ts_items[:8]
+                ts_str = ", ".join(f"{p}={v}" for p, v in display)
+                if len(ts_items) > 8:
+                    ts_str += f"... (共{len(ts_items)}期)"
             parts.append(f"  时间序列: {ts_str}")
         if ctx.upstream:
             names = [u.name for u in ctx.upstream[:3]]

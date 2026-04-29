@@ -67,6 +67,8 @@ def main():
     stats2 = graph.stats()
     print(f"  Indicators:        {stats2['total_indicators']:,}")
     print(f"  Tables:            {stats2['total_tables']:,}")
+    unlinked = stats2.get("unlinked_cells", 0)
+    print(f"  Unlinked cells:    {unlinked:,}")
     print(f"  Build time:        {t5-t4:.1f}s")
 
     print(f"\nSaving JSON to: {args.output_dir}/")

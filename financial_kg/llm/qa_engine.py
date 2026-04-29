@@ -106,6 +106,25 @@ class QAEngine:
             cypher_results=cypher_results,
         )
 
+    def _retrieval_only_response(self, retrieval: RetrievalResult) -> QAResponse:
+        """Format retrieval results as a readable answer when no LLM is configured."""
+        if not retrieval.contexts:
+            return QAResponse(answer="未找到相关指标数据。", retrieved_contexts=[])
+        lines = ["以下是检索到的相关指标数据（未配置 LLM，仅展示原始数据）：\n"]
+        for ctx in retrieval.contexts:
+            ind = ctx.indicator
+            line = f"- **{ind.name}**"
+            if ind.unit:
+                line += f" [{ind.unit}]"
+            if retrieval.query_years and ind.time_series:
+                hits = [(k, v) for k, v in ind.time_series.items() if any(y in str(k) for y in retrieval.query_years)]
+                for k, v in hits:
+                    line += f"\n  {k}: {v}"
+            elif ind.summary_value is not None:
+                line += f": {ind.summary_value}"
+            lines.append(line)
+        return QAResponse(answer="\n".join(lines), retrieved_contexts=retrieval.contexts)
+
     def ask_stream(
         self,
         question: str,

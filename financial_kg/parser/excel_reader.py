@@ -49,11 +49,15 @@ def read_excel(filepath: str) -> dict[str, list[CellData]]:
 
         # Build merge map: cell_coord -> parent_coord (top-left of merge group)
         merge_map: dict[str, str] = {}
+        # Also track merge range info for the top-left cell
+        merge_info: dict[str, tuple[int, str]] = {}  # parent_coord -> (end_row, end_col)
         for merge_range in ws_formula.merged_cells.ranges:
             min_row, min_col = merge_range.min_row, merge_range.min_col
+            max_row, max_col = merge_range.max_row, merge_range.max_col
             parent_coord = f"{get_column_letter(min_col)}{min_row}"
-            for row in range(merge_range.min_row, merge_range.max_row + 1):
-                for col in range(merge_range.min_col, merge_range.max_col + 1):
+            merge_info[parent_coord] = (max_row, get_column_letter(max_col))
+            for row in range(min_row, max_row + 1):
+                for col in range(min_col, max_col + 1):
                     coord = f"{get_column_letter(col)}{row}"
                     if coord != parent_coord:
                         merge_map[coord] = parent_coord
@@ -88,6 +92,12 @@ def read_excel(filepath: str) -> dict[str, list[CellData]]:
                     p_col, p_row = coordinate_from_string(parent_coord)
                     merge_parent_id = f"{sheet_name}_{p_row}_{p_col}"
 
+                # Merge range info for top-left cell
+                merge_end_row: Optional[int] = None
+                merge_end_col: Optional[str] = None
+                if coord in merge_info:
+                    merge_end_row, merge_end_col = merge_info[coord]
+
                 cells.append(CellData(
                     sheet=sheet_name,
                     row=cell_f.row,
@@ -97,6 +107,8 @@ def read_excel(filepath: str) -> dict[str, list[CellData]]:
                     data_type=data_type,
                     is_merged=is_merged,
                     merge_parent_id=merge_parent_id,
+                    merge_end_row=merge_end_row,
+                    merge_end_col=merge_end_col,
                     number_format=cell_f.number_format or None,
                 ))
 

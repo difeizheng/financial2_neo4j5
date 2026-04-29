@@ -151,8 +151,13 @@ if last_retrieval and last_retrieval.contexts:
                 f"**{ind.name}** — 匹配方式: `{ctx.match_reason}` 分数: {ctx.match_score:.2f}"
             )
             if ind.time_series:
-                ts_items = list(ind.time_series.items())[:5]
-                st.caption("  ".join(f"{p}={v}" for p, v in ts_items))
+                ts_items = list(ind.time_series.items())
+                query_years = getattr(last_retrieval, "query_years", [])
+                if query_years:
+                    hits = [(k, v) for k, v in ts_items if any(y in str(k) for y in query_years)]
+                    if hits:
+                        st.caption("查询年份: " + "  ".join(f"{k}={v}" for k, v in hits))
+                st.caption("  ".join(f"{p}={v}" for p, v in ts_items[:5]))
             if ctx.upstream:
                 st.caption("上游: " + ", ".join(u.name for u in ctx.upstream))
             if ctx.downstream:

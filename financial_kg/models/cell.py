@@ -14,6 +14,8 @@ class CellData:
     data_type: str    # "number" | "string" | "date" | "bool" | "formula" | "empty"
     is_merged: bool = False
     merge_parent_id: Optional[str] = None  # id of the top-left cell in merge group
+    merge_end_row: Optional[int] = None    # for top-left of merge: end row of merged range
+    merge_end_col: Optional[str] = None    # for top-left of merge: end col of merged range
     number_format: Optional[str] = None    # Excel number format string, e.g. 'yyyy"年"m"月"'
 
     @property

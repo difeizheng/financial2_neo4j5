@@ -80,6 +80,22 @@ if diff.summary["sheets_affected"]:
 
 if diff.affected_indicators:
     st.subheader("受影响 Indicator")
+
+    # Sheet filter + name search
+    col_sheet, col_name = st.columns(2)
+    with col_sheet:
+        all_sheets = sorted({i["sheet"] for i in diff.affected_indicators if i.get("sheet")})
+        selected_sheets = st.multiselect("按 Sheet 筛选", all_sheets, default=[])
+    with col_name:
+        ind_search = st.text_input("搜索名称", placeholder="输入关键词...")
+
+    filtered_indicators = diff.affected_indicators
+    if selected_sheets:
+        filtered_indicators = [i for i in filtered_indicators if i["sheet"] in selected_sheets]
+    if ind_search:
+        keyword = ind_search.lower()
+        filtered_indicators = [i for i in filtered_indicators if keyword in i["name"].lower()]
+
     rows = [
         {
             "Indicator": i["name"],
@@ -88,9 +104,11 @@ if diff.affected_indicators:
             "新汇总值": i["new_summary"],
             "变化单元格数": i["changed_cell_count"],
         }
-        for i in diff.affected_indicators
+        for i in filtered_indicators
     ]
     st.dataframe(rows, use_container_width=True)
+    if ind_search or selected_sheets:
+        st.caption(f"筛选结果：{len(rows)} / {len(diff.affected_indicators)} 个 Indicator")
 
 if diff.changed_cells:
     with st.expander(f"变化单元格明细（共 {len(diff.changed_cells)} 条，显示前 200）"):
@@ -110,11 +128,30 @@ if diff.changed_cells:
 if diff.changed_cells:
     st.subheader("变化传播图")
 
+    # Search across ALL changed cells, display top 200 matches
+    cell_search = st.text_input("搜索传播起点", placeholder="输入 Cell ID、Sheet 名或值...")
+    if cell_search:
+        kw = cell_search.lower()
+        candidates = [
+            c for c in diff.changed_cells
+            if kw in c["id"].lower()
+            or kw in c.get("sheet", "").lower()
+            or kw in str(c.get("old", "")).lower()
+            or kw in str(c.get("new", "")).lower()
+        ]
+    else:
+        candidates = diff.changed_cells
+
     cell_options = {
         f"{c['id']}  ({c['sheet']})  {c['old']} → {c['new']}": c["id"]
-        for c in diff.changed_cells[:200]
+        for c in candidates[:200]
     }
+    if not cell_options:
+        st.warning("无匹配的变化单元格，请调整搜索条件")
+        st.stop()
     root_id = cell_options[st.selectbox("选择传播起点", list(cell_options.keys()))]
+    if cell_search and len(candidates) > 200:
+        st.caption(f"匹配 {len(candidates)} 个，显示前 200 个")
 
     col_d, col_s = st.columns(2)
     max_depth = col_d.slider("最大传播深度", 1, 15, 8)

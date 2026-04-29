@@ -75,10 +75,13 @@ if uploaded:
 
             elapsed = time.time() - t0
             st.success(f"解析完成！耗时 {elapsed:.1f}s")
-            col1, col2, col3 = st.columns(3)
+            col1, col2, col3, col4 = st.columns(4)
             col1.metric("Cell 节点", f"{stats['total_cells']:,}")
             col2.metric("Indicator 节点", f"{stats['total_indicators']:,}")
             col3.metric("Table 节点", f"{stats['total_tables']:,}")
+            unlinked = stats.get("unlinked_cells", 0)
+            unlinked_pct = f"{unlinked / stats['total_cells'] * 100:.1f}%" if stats['total_cells'] else "0%"
+            col4.metric("未关联 Table 的 Cell", f"{unlinked:,}", delta=unlinked_pct)
 
             st.subheader("输出文件")
             for layer, path in paths.items():

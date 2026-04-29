@@ -71,7 +71,7 @@ def build_indicators(
         for cd in cell_list:
             rows.setdefault(cd.row, {})[cd.col] = cd.value
 
-        tables = detect_tables(sheet_name, rows)
+        tables = detect_tables(sheet_name, rows, cell_list=cell_list)
 
         for tbl in tables:
             table_id = _make_table_id(sheet_name, tbl.header_row)

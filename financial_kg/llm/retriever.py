@@ -21,6 +21,7 @@ class IndicatorContext:
 class RetrievalResult:
     contexts: list[IndicatorContext]
     query_tokens: list[str]
+    query_years: list[str]
     total_candidates: int
 
 
@@ -72,6 +73,7 @@ class IndicatorRetriever:
         return RetrievalResult(
             contexts=contexts,
             query_tokens=tokens,
+            query_years=years,
             total_candidates=len(scored),
         )
 
@@ -88,13 +90,14 @@ class IndicatorRetriever:
                         tokens.append(seg[i : i + n])
             elif len(seg) >= 2:
                 tokens.append(seg)
-        # Deduplicate while preserving order
+        # Deduplicate while preserving order, then sort longest-first for better exact matching
         seen: set[str] = set()
         result: list[str] = []
         for t in tokens:
             if t not in seen:
                 seen.add(t)
                 result.append(t)
+        result.sort(key=len, reverse=True)
         return result
 
     def _score(
@@ -107,14 +110,23 @@ class IndicatorRetriever:
         # Exact name match — highest priority
         for token in tokens:
             if token == name:
-                return 10.0, "exact_name"
+                score = 10.0
+                if years and any(y in str(k) for y in years for k in ind.time_series):
+                    score += 2.0
+                return score, "exact_name"
 
         # Substring match — bidirectional: token-in-name OR name-in-token
         for token in tokens:
             if token in name:
-                return 5.0 + len(token) / max(len(name), 1), "fuzzy_name"
+                score = 5.0 + len(token) / max(len(name), 1)
+                if years and any(y in str(k) for y in years for k in ind.time_series):
+                    score += 2.0
+                return score, "fuzzy_name"
             if len(name) >= 2 and name in token:
-                return 5.0 + len(name) / max(len(token), 1), "fuzzy_name"
+                score = 5.0 + len(name) / max(len(token), 1)
+                if years and any(y in str(k) for y in years for k in ind.time_series):
+                    score += 2.0
+                return score, "fuzzy_name"
 
         # Fuzzy match on name
         best_fuzzy = 0.0

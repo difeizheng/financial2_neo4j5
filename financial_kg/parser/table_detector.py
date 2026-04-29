@@ -1,10 +1,15 @@
 """Table boundary detection within Excel sheets.
 
 Each sheet may contain one or more logical tables. This module uses
-rule-based heuristics to identify:
-  - Table boundaries (start/end rows)
-  - Header rows
-  - Column roles: name, sequence, value, unit, time_series, category, notes
+spatial analysis adapted from excel_table_extractor.py:
+
+1. Identify vertical merged cells (>=3 rows) as L-shaped table anchors
+2. For cells NOT in any anchor's territory, BFS-expand as rectangular tables
+3. For each anchor, expand an L-table via row-scanning (not cell-level BFS)
+   — this is the key insight: row-scanning tolerates sparse columns within a table
+4. Merge adjacent tables on the same rows with small column gaps
+5. Classify columns by header labels and data sampling
+6. Filter out trivial tables (<=1 row or <=1 cell)
 """
 from __future__ import annotations
 import re
@@ -14,7 +19,7 @@ from typing import Optional
 from openpyxl.utils import get_column_letter, column_index_from_string
 
 
-# ── Column role keywords ─────────────────────────────────────────────────────
+# --- Column role keywords ---
 
 _UNIT_KEYWORDS = {"单位", "万元", "元", "亿元", "%", "MW", "kW", "h", "年", "月", "个"}
 _NAME_KEYWORDS = {"项目", "名称", "参数", "指标", "科目"}
@@ -22,23 +27,18 @@ _SEQ_KEYWORDS = {"序号", "编号", "序"}
 _CATEGORY_KEYWORDS = {"类别", "分类", "大类"}
 _TOTAL_KEYWORDS = {"合计", "小计", "汇总", "总计", "总额"}
 _NOTES_KEYWORDS = {"备注", "说明", "注", "取值说明", "参数释义"}
+_HEADER_KEYWORDS = _SEQ_KEYWORDS | _NAME_KEYWORDS | _CATEGORY_KEYWORDS | _UNIT_KEYWORDS | _NOTES_KEYWORDS
 
 
 def _is_excel_date_serial(v) -> bool:
-    """Heuristic: integer in range of plausible Excel date serials (2000-2100).
-
-    Must be a whole number — real date serials have no fractional part.
-    Fractional values (e.g. 44590.14) are financial data, not dates.
-    """
     if not isinstance(v, (int, float)) or isinstance(v, bool):
         return False
-    if v != int(v):  # fractional → not a date serial
+    if v != int(v):
         return False
-    return 36526 <= v <= 73050  # 2000-01-01 to 2099-12-31
+    return 36526 <= v <= 73050
 
 
 def _excel_serial_to_label(serial: float) -> str:
-    """Convert Excel date serial to YYYY-MM label."""
     try:
         dt = datetime.fromordinal(datetime(1899, 12, 30).toordinal() + int(serial))
         return dt.strftime("%Y-%m")
@@ -47,12 +47,10 @@ def _excel_serial_to_label(serial: float) -> str:
 
 
 def _is_year_value(v) -> bool:
-    """Heuristic: integer that looks like a year (2000-2100)."""
     return isinstance(v, (int, float)) and 2000 <= v <= 2100 and v == int(v)
 
 
 def _looks_like_sequence(v) -> bool:
-    """Heuristic: value looks like a sequence number (1, 1.1, 2, 'A', etc.)."""
     if isinstance(v, (int, float)):
         return 0 < v < 1000
     if isinstance(v, str):
@@ -60,7 +58,7 @@ def _looks_like_sequence(v) -> bool:
     return False
 
 
-# ── Table structure ──────────────────────────────────────────────────────────
+# --- Table structure ---
 
 class ColRole:
     CATEGORY = "category"
@@ -78,17 +76,17 @@ class TableInfo:
     """Detected table within a sheet."""
 
     def __init__(self, sheet: str, header_row: int, data_start: int, data_end: int,
-                 title: Optional[str] = None):
+                 title: Optional[str] = None,
+                 start_col: Optional[str] = None, end_col: Optional[str] = None):
         self.sheet = sheet
         self.header_row = header_row
         self.data_start = data_start
         self.data_end = data_end
-        self.title = title  # sub-table title from the row above the header, e.g. "成本费用表-资本金"
-        # col_letter -> ColRole string
+        self.title = title
+        self.start_col = start_col
+        self.end_col = end_col
         self.col_roles: dict[str, str] = {}
-        # col_letter -> header label
         self.col_labels: dict[str, str] = {}
-        # col_letter -> period label (for time_series cols)
         self.time_period_labels: dict[str, str] = {}
 
     def name_col(self) -> Optional[str]:
@@ -124,68 +122,655 @@ class TableInfo:
     def time_series_cols(self) -> list[str]:
         return [col for col, role in self.col_roles.items() if role == ColRole.TIME_SERIES]
 
+# --- Merged cell helpers ---
 
-# ── Main detection function ──────────────────────────────────────────────────
+def _build_merge_groups(cell_list: list) -> dict:
+    """Build merge group info from CellData list.
+
+    Uses merge_end_row/merge_end_col fields on top-left cells.
+    Returns: {parent_id: {"rows": set, "cols": set, "cells": set}}
+    """
+    groups: dict = {}
+    for cd in cell_list:
+        if cd.merge_end_row is not None and cd.merge_end_col is not None:
+            parent_id = cd.id
+            groups[parent_id] = {
+                "rows": set(range(cd.row, cd.merge_end_row + 1)),
+                "cols": set(),
+                "cells": set(),
+            }
+            # Fill in cols and cells
+            for c_idx in range(
+                column_index_from_string(cd.col),
+                column_index_from_string(cd.merge_end_col) + 1,
+            ):
+                col_letter = get_column_letter(c_idx)
+                groups[parent_id]["cols"].add(col_letter)
+                for r in range(cd.row, cd.merge_end_row + 1):
+                    groups[parent_id]["cells"].add((r, col_letter))
+    return groups
+
+
+def _find_vertical_anchors(
+    merge_groups: dict,
+    rows: dict[int, dict[str, object]],
+    sheet_name: str,
+) -> list[dict]:
+    """Find vertical merged cells that serve as L-table anchors.
+
+    Criteria: >= 3 rows tall, <= 2 cols wide, non-empty top-left value.
+    Returns sorted list of {start_row, start_col, end_row, end_col, parent_id}.
+    """
+    anchors = []
+    for parent_id, info in merge_groups.items():
+        rows_set = info["rows"]
+        cols_set = info["cols"]
+        if len(rows_set) < 3:
+            continue
+        if len(cols_set) > 2:
+            continue
+        # The parent cell is the top-left of the merge group
+        # Parse parent_id: "sheet_row_col" -> extract row and col
+        parts = parent_id.split("_")
+        if len(parts) < 3:
+            continue
+        try:
+            anchor_row = int(parts[-2])
+            anchor_col = parts[-1]
+        except (ValueError, IndexError):
+            continue
+        if parent_id.startswith(sheet_name + "_"):
+            if anchor_row in rows and anchor_col in rows[anchor_row]:
+                anchors.append({
+                    "start_row": min(rows_set),
+                    "start_col": min(cols_set, key=column_index_from_string),
+                    "end_row": max(rows_set),
+                    "end_col": max(cols_set, key=column_index_from_string),
+                    "parent_id": parent_id,
+                })
+    anchors.sort(key=lambda a: (a["start_row"], column_index_from_string(a["start_col"])))
+    return anchors
+
+
+def _col_offset(col: str, delta: int) -> str | None:
+    idx = column_index_from_string(col) + delta
+    if idx < 1:
+        return None
+    return get_column_letter(idx)
+
+
+def _looks_like_table_header(row_data: dict) -> bool:
+    """Check if a row looks like a column header row (not a data row).
+
+    After a gap, this distinguishes a new table's header row from
+    the resumption of an L-table after a section break.
+
+    A header row: mostly/all text labels, no numeric values, and
+    at least two known header keywords to avoid false positives.
+    """
+    if not row_data:
+        return False
+    values = [v for v in row_data.values() if v is not None]
+    if not values:
+        return False
+    str_vals = [v for v in values if isinstance(v, str) and v.strip()]
+    num_vals = [v for v in values if isinstance(v, (int, float)) and not isinstance(v, bool)]
+    if num_vals:
+        return False
+    if len(str_vals) < 2:
+        return False
+    matches = sum(1 for v in str_vals if any(kw in v for kw in _HEADER_KEYWORDS))
+    return matches >= 2
+
+
+def _is_in_recognized_range(
+    row: int, col: str, recognized_ranges: list[tuple[int, str, int, str]],
+) -> bool:
+    for sr, sc, er, ec in recognized_ranges:
+        if sr <= row <= er and column_index_from_string(sc) <= column_index_from_string(col) <= column_index_from_string(ec):
+            return True
+    return False
+
+
+def _connected_column_groups(
+    row_data: dict[str, object], min_col_idx: int, max_gap: int = 5,
+) -> list[list[str]]:
+    """Group non-empty columns into connected clusters by column index gap.
+
+    Two columns with gap ≤ max_gap empty columns between them are in the same group.
+    Only considers columns at or to the right of min_col_idx.
+    """
+    cols = sorted(
+        [c for c in row_data if row_data[c] is not None
+         and column_index_from_string(c) >= min_col_idx],
+        key=column_index_from_string,
+    )
+    if not cols:
+        return []
+    groups: list[list[str]] = []
+    current = [cols[0]]
+    for i in range(1, len(cols)):
+        gap = column_index_from_string(cols[i]) - column_index_from_string(cols[i - 1]) - 1
+        if gap <= max_gap:
+            current.append(cols[i])
+        else:
+            groups.append(current)
+            current = [cols[i]]
+    groups.append(current)
+    return groups
+
+
+# --- Main detection function ---
 
 def detect_tables(
     sheet_name: str,
-    rows: dict[int, dict[str, object]],  # row_num -> {col_letter: value}
+    rows: dict[int, dict[str, object]],
+    cell_list: list | None = None,
 ) -> list[TableInfo]:
-    """Detect logical tables within a sheet.
+    """Detect logical tables within a sheet using spatial analysis.
+
+    Algorithm (adapted from excel_table_extractor.py):
+    1. Build merge groups from CellData -> find vertical anchors
+    2. Row-scan-expand L-tables from each vertical anchor (L-tables first)
+    3. BFS-expand rectangular tables from remaining unvisited cells
+    4. Merge adjacent tables with small column gaps
+    5. Filter trivial tables (<=1 row or <=1 cell)
 
     Args:
         sheet_name: Name of the sheet.
         rows: Dict mapping row number to dict of {col_letter: cell_value}.
+        cell_list: Optional list of CellData for merge info.
 
     Returns:
-        List of TableInfo objects, one per detected table.
+        List of TableInfo objects.
     """
     if not rows:
         return []
 
-    sorted_row_nums = sorted(rows.keys())
+    merge_groups = _build_merge_groups(cell_list) if cell_list else {}
+    anchors = _find_vertical_anchors(merge_groups, rows, sheet_name)
 
-    # ── Step 1: find header rows ─────────────────────────────────────────────
-    # A header row is a row where most non-empty values are strings and
-    # at least one matches a known header keyword.
-    header_rows = _find_header_rows(rows, sorted_row_nums)
+    max_row = max(rows.keys())
+    all_cols = set()
+    for row_data in rows.values():
+        all_cols.update(row_data.keys())
+    max_col = max(all_cols, key=column_index_from_string) if all_cols else "A"
 
-    if not header_rows:
-        # Fallback: treat first non-empty row as header
-        header_rows = [sorted_row_nums[0]]
-
-    # ── Step 2: split into table segments by header rows ────────────────────
+    visited: set[tuple[int, str]] = set()
+    recognized_ranges: list[tuple[int, str, int, str]] = []
     tables: list[TableInfo] = []
-    for i, hrow in enumerate(header_rows):
-        data_start = hrow + 1
-        # data ends just before the next header row (or at last row)
-        if i + 1 < len(header_rows):
-            next_hrow = header_rows[i + 1]
-            # The row just before the next header is often a sub-table title row
-            # (a single-cell string label like "成本费用表-全投资").
-            # Walk backwards from next_hrow-1 to find the true last data row.
-            data_end = next_hrow - 1
-            while data_end >= data_start:
-                candidate = rows.get(data_end, {})
-                vals = [v for v in candidate.values() if v is not None]
-                str_vals = [v for v in vals if isinstance(v, str) and v.strip()]
-                # A title row: only 1 non-empty cell and it's a string (no numbers)
-                num_vals = [v for v in vals if isinstance(v, (int, float)) and not isinstance(v, bool)]
-                if len(vals) <= 2 and len(str_vals) >= 1 and len(num_vals) == 0:
-                    data_end -= 1  # skip this title/blank row
-                elif not vals:
-                    data_end -= 1  # skip empty row
-                else:
-                    break
-        else:
-            data_end = sorted_row_nums[-1]
 
-        if data_start > data_end:
+    # --- Phase 1: Identify anchor territory ---
+    anchor_territories: list[tuple[int, int, str, str]] = []  # (start_row, end_row, start_col, end_col)
+    for a in anchors:
+        territory_end_col = _col_offset(a["start_col"], 100)
+        if territory_end_col is None:
+            territory_end_col = max_col
+        anchor_territories.append((max(1, a["start_row"] - 1), a["end_row"], a["start_col"], territory_end_col))
+
+    # --- Phase 2: L-table expansion from each anchor (FIRST, so
+    # L-tables get priority over rectangular BFS expansion) ---
+    for a in anchors:
+        if (a["start_row"], a["start_col"]) in visited:
             continue
 
-        # Extract sub-table title: look for a single-string row just above header
-        title: Optional[str] = None
-        for title_row_num in range(hrow - 1, max(hrow - 4, 0), -1):
+        # Pre-scan: detect disconnected sub-table immediately above the anchor.
+        # If row ar-1 has data far from the anchor column (>4 gap) AND looks
+        # like a table header, BFS-expand it as a separate table first so the
+        # L-table won't absorb its cells (Problem 3: J-N table rows 182-187).
+        ar, ac = a["start_row"], a["start_col"]
+        if ar > 1:
+            pre_row = rows.get(ar - 1, {})
+            pre_cols = sorted(
+                [c for c in pre_row if pre_row[c] is not None],
+                key=column_index_from_string,
+            )
+            if pre_cols:
+                min_pre_col_idx = column_index_from_string(pre_cols[0])
+                anchor_col_idx = column_index_from_string(ac)
+                if min_pre_col_idx - anchor_col_idx > 4 and _looks_like_table_header(pre_row):
+                    sub = _bfs_expand_rect_table(
+                        ar - 1, pre_cols[0], rows, visited, max_row, max_col, recognized_ranges,
+                    )
+                    if sub:
+                        recognized_ranges.append((
+                            sub["start_row"], sub["start_col"],
+                            sub["end_row"], sub["end_col"],
+                        ))
+                        tables.append(sub)
+
+        table_info = _expand_l_table(
+            a, rows, visited, max_row, max_col, recognized_ranges,
+        )
+        if table_info is None:
+            continue
+
+        # Find overlapping recognized ranges -> excluded_ranges
+        excluded = []
+        sr, sc, er, ec = table_info["start_row"], table_info["start_col"], table_info["end_row"], table_info["end_col"]
+        for rr in recognized_ranges:
+            rsr, rsc, rer, rec = rr
+            if (rsr <= er and rer >= sr and
+                column_index_from_string(rsc) <= column_index_from_string(ec) and
+                column_index_from_string(rec) >= column_index_from_string(sc)):
+                excluded.append(rr)
+        table_info["excluded_ranges"] = excluded
+
+        tables.append(table_info)
+        recognized_ranges.append((sr, sc, er, ec))
+
+        # Mark inner anchors as visited
+        for a2 in anchors:
+            if sr <= a2["start_row"] <= er and column_index_from_string(sc) <= column_index_from_string(a2["start_col"]) <= column_index_from_string(ec):
+                visited.add((a2["start_row"], a2["start_col"]))
+
+    # --- Phase 3: BFS-expand rectangular tables from remaining unvisited cells ---
+    sorted_positions = []
+    for r in sorted(rows.keys()):
+        for c in sorted(rows[r].keys(), key=column_index_from_string):
+            sorted_positions.append((r, c))
+
+    for r, c in sorted_positions:
+        if (r, c) in visited:
+            continue
+
+        # Skip L-anchor top-left cells
+        is_anchor_top = False
+        for a in anchors:
+            if a["start_row"] == r and a["start_col"] == c:
+                is_anchor_top = True
+                break
+        if is_anchor_top:
+            continue
+
+        # Skip cells in anchor territory
+        in_territory = False
+        for tr, ter, tc, tec in anchor_territories:
+            if tr <= r <= ter and column_index_from_string(tc) <= column_index_from_string(c):
+                in_territory = True
+                break
+        if in_territory:
+            continue
+
+        table_info = _bfs_expand_rect_table(
+            r, c, rows, visited, max_row, max_col, recognized_ranges,
+        )
+        if table_info:
+            tables.append(table_info)
+            recognized_ranges.append((
+                table_info["start_row"], table_info["start_col"],
+                table_info["end_row"], table_info["end_col"],
+            ))
+
+    # --- Phase 4: Merge adjacent tables ---
+    tables = _merge_adjacent_tables(tables, rows, max_row, max_col)
+
+    # Sort
+    tables.sort(key=lambda t: (t["start_row"], column_index_from_string(t["start_col"])))
+
+    # --- Phase 5: Convert to TableInfo and filter ---
+    result: list[TableInfo] = []
+    for raw in tables:
+        tbl = _raw_to_table_info(sheet_name, raw, rows)
+        if tbl is not None:
+            result.append(tbl)
+
+    # --- Phase 6: Per-sheet numbering and title formatting ---
+    for idx, tbl in enumerate(result, 1):
+        sheet_short = sheet_name.strip()
+        if tbl.title:
+            tbl.title = f"{sheet_short}-{idx}-{tbl.title}"
+        else:
+            tbl.title = f"{sheet_short}-{idx}"
+
+    return result
+
+
+# --- Rectangular table expansion (BFS) ---
+
+def _bfs_expand_rect_table(
+    start_row: int, start_col: str,
+    rows: dict[int, dict[str, object]],
+    visited: set,
+    max_row: int, max_col: str,
+    recognized_ranges: list,
+) -> dict | None:
+    """BFS from a starting cell to find a rectangular connected block."""
+    table_cells: set[tuple[int, str]] = set()
+    queue = [(start_row, start_col)]
+
+    while queue:
+        r, c = queue.pop(0)
+        if (r, c) in visited:
+            continue
+        visited.add((r, c))
+
+        # Check if in recognized range
+        if _is_in_recognized_range(r, c, recognized_ranges):
+            continue
+
+        if r in rows and c in rows[r] and rows[r][c] is not None:
+            table_cells.add((r, c))
+        else:
+            continue
+
+        # Explore neighbors
+        for nr, nc in [(r - 1, c), (r + 1, c), (r, _col_offset(c, -1)), (r, _col_offset(c, 1))]:
+            if nc is None:
+                continue
+            if nr < 1 or nr > max_row:
+                continue
+            if column_index_from_string(nc) > column_index_from_string(max_col):
+                continue
+            if (nr, nc) in visited:
+                continue
+            queue.append((nr, nc))
+
+    if not table_cells:
+        return None
+
+    rs = [p[0] for p in table_cells]
+    cs = [column_index_from_string(p[1]) for p in table_cells]
+    return {
+        "start_row": min(rs), "end_row": max(rs),
+        "start_col": get_column_letter(min(cs)), "end_col": get_column_letter(max(cs)),
+        "cells": table_cells,
+    }
+
+
+# --- L-table expansion (row-scanning) ---
+
+def _expand_l_table(
+    anchor: dict,
+    rows: dict[int, dict[str, object]],
+    visited: set,
+    max_row: int, max_col: str,
+    recognized_ranges: list,
+) -> dict | None:
+    """Expand an L-shaped table from a vertical anchor.
+
+    Key difference from BFS: scans entire rows until an empty row,
+    tolerating sparse columns within the table.
+    """
+    ar, ac, aer, aec = anchor["start_row"], anchor["start_col"], anchor["end_row"], anchor["end_col"]
+
+    table_cells: set[tuple[int, str]] = set()
+
+    # Add anchor region cells
+    for r in range(ar, aer + 1):
+        for c_idx in range(column_index_from_string(ac), column_index_from_string(aec) + 1):
+            c = get_column_letter(c_idx)
+            table_cells.add((r, c))
+            visited.add((r, c))
+
+    # Find max data column: scan anchor row + next 50 rows for rightmost data
+    max_data_col_idx = column_index_from_string(aec)
+    for r in range(ar, min(ar + 51, max_row + 1)):
+        if r not in rows:
+            continue
+        for c in sorted(rows[r].keys(), key=column_index_from_string):
+            c_idx = column_index_from_string(c)
+            if c_idx > column_index_from_string(aec) and rows[r][c] is not None:
+                max_data_col_idx = max(max_data_col_idx, c_idx)
+
+    # Row-scan downward with gap tolerance: skip ≤2 consecutive empty rows,
+    # break at 3+ empty rows. This allows L-tables to span section breaks
+    # that are separated by 1-2 empty rows.
+    # Start one row above anchor to capture header row (e.g. row 3 before
+    # anchor at row 4), but don't go below row 1.
+    current_row = ar
+    if ar > 1:
+        pre_row = rows.get(ar - 1, {})
+        pre_cols = [column_index_from_string(c) for c in pre_row if pre_row[c] is not None]
+        if pre_cols:
+            min_pre_col = min(pre_cols)
+            anchor_col_idx = column_index_from_string(ac)
+            if min_pre_col - anchor_col_idx <= 4:
+                # Adjacent — extend upward to capture header/title
+                current_row = ar - 1
+            # else: disconnected — leave for BFS, start from anchor row
+
+    consecutive_empty = 0
+    while current_row <= max_row:
+        row_has_data = False
+        for c_idx in range(column_index_from_string(ac), max_data_col_idx + 1):
+            c = get_column_letter(c_idx)
+            if _is_in_recognized_range(current_row, c, recognized_ranges):
+                row_has_data = True
+                break
+            if current_row in rows and c in rows[current_row] and rows[current_row][c] is not None:
+                row_has_data = True
+                break
+
+        if not row_has_data:
+            if ar <= current_row <= aer:
+                # Empty rows within the anchor range are always OK
+                for c_idx in range(column_index_from_string(ac), max_data_col_idx + 1):
+                    visited.add((current_row, get_column_letter(c_idx)))
+                current_row += 1
+                consecutive_empty = 0
+                continue
+
+            consecutive_empty += 1
+            if consecutive_empty >= 3:
+                break
+            # Mark this empty row's cells as visited
+            for c_idx in range(column_index_from_string(ac), max_data_col_idx + 1):
+                visited.add((current_row, get_column_letter(c_idx)))
+            current_row += 1
+            continue
+
+        # Data resumed after a gap — check for new table or orphan note
+        if consecutive_empty > 0:
+            row_data = rows.get(current_row, {})
+            if _looks_like_table_header(row_data):
+                break
+            # Single-cell text row after a gap is likely an orphan note,
+            # not part of the same table
+            non_empty = [v for v in row_data.values() if v is not None]
+            if len(non_empty) == 1 and all(isinstance(v, str) and not v.strip().isdigit() for v in non_empty):
+                break
+
+        consecutive_empty = 0
+
+        # Add cells in this row — only from the column group connected to
+        # the anchor column. Disconnected groups (gap > 5 empty cols) are
+        # left unvisited for BFS Phase 3 to pick up as separate tables.
+        row_data = rows.get(current_row, {})
+        groups = _connected_column_groups(row_data, column_index_from_string(ac), max_gap=5)
+        anchor_group: list[str] = []
+        for g in groups:
+            if ac in g:
+                anchor_group = g
+                break
+        if not anchor_group and groups:
+            # No group contains anchor — pick the leftmost group closest to anchor
+            anchor_group = min(groups, key=lambda g: column_index_from_string(g[0]))
+
+        anchor_col_set = set(anchor_group)
+        for c_idx in range(column_index_from_string(ac), max_data_col_idx + 1):
+            c = get_column_letter(c_idx)
+            if c not in anchor_col_set:
+                continue
+            if _is_in_recognized_range(current_row, c, recognized_ranges):
+                continue
+            if (current_row, c) in visited:
+                continue
+            if current_row in rows and c in rows[current_row] and rows[current_row][c] is not None:
+                table_cells.add((current_row, c))
+            visited.add((current_row, c))
+
+        current_row += 1
+
+    if not table_cells:
+        return None
+
+    rs = [p[0] for p in table_cells]
+    cs = [column_index_from_string(p[1]) for p in table_cells]
+
+    # Use anchor's top-left cell value as fallback title (e.g. "季度还款")
+    title_text = None
+    anchor_val = rows.get(ar, {}).get(ac)
+    if anchor_val is not None and isinstance(anchor_val, str) and anchor_val.strip():
+        title_text = str(anchor_val).strip()
+
+    return {
+        "start_row": min(rs), "end_row": max(rs),
+        "start_col": get_column_letter(min(cs)), "end_col": get_column_letter(max(cs)),
+        "cells": table_cells,
+        "title_text": title_text,
+    }
+
+
+# --- Merge adjacent tables ---
+
+def _merge_adjacent_tables(
+    tables: list[dict],
+    rows: dict[int, dict[str, object]],
+    max_row: int, max_col: str,
+) -> list[dict]:
+    """Merge tables on similar rows with small column gaps and bridging content."""
+    if not tables:
+        return tables
+
+    merged = []
+    used = set()
+    for i, t1 in enumerate(tables):
+        if i in used:
+            continue
+        current = dict(t1)
+        for j, t2 in enumerate(tables):
+            if j <= i or j in used:
+                continue
+            col_gap = column_index_from_string(t2["start_col"]) - column_index_from_string(current["end_col"]) - 1
+            row_overlap = (current["start_row"] <= t2["end_row"] and t2["start_row"] <= current["end_row"])
+
+            if row_overlap and 0 < col_gap <= 3:
+                # Check for bridging content
+                title_row = min(current["start_row"], t2["start_row"]) - 1
+                has_bridge = False
+                for check_row in [title_row, min(current["start_row"], t2["start_row"])]:
+                    if 1 <= check_row <= max_row and check_row in rows:
+                        for c_idx in range(
+                            column_index_from_string(current["start_col"]),
+                            max(column_index_from_string(current["end_col"]), column_index_from_string(t2["end_col"])) + 1,
+                        ):
+                            c = get_column_letter(c_idx)
+                            if c in rows[check_row] and rows[check_row][c] is not None:
+                                has_bridge = True
+                                break
+                    if has_bridge:
+                        break
+
+                if has_bridge:
+                    # Preserve current's excluded_ranges before recreating dict
+                    existing_excluded = list(current.get("excluded_ranges", []))
+                    existing_title = current.get("title_text")
+                    new_cells = current.get("cells", set()) | t2.get("cells", set())
+                    new_sr = min(current["start_row"], t2["start_row"])
+                    new_er = max(current["end_row"], t2["end_row"])
+                    new_sc = get_column_letter(min(
+                        column_index_from_string(current["start_col"]),
+                        column_index_from_string(t2["start_col"]),
+                    ))
+                    new_ec = get_column_letter(max(
+                        column_index_from_string(current["end_col"]),
+                        column_index_from_string(t2["end_col"]),
+                    ))
+                    current = {
+                        "start_row": new_sr, "end_row": new_er,
+                        "start_col": new_sc, "end_col": new_ec,
+                        "cells": new_cells,
+                    }
+                    # Carry forward title from current or adopt from t2
+                    if existing_title:
+                        current["title_text"] = existing_title
+                    elif "title_text" in t2:
+                        current["title_text"] = t2["title_text"]
+                    # Merge excluded_ranges from both tables
+                    current["excluded_ranges"] = existing_excluded + list(t2.get("excluded_ranges", []))
+                    used.add(j)
+
+        merged.append(current)
+        used.add(i)
+
+    return merged
+
+
+# --- Conversion to TableInfo ---
+
+def _raw_to_table_info(
+    sheet_name: str, raw: dict,
+    rows: dict[int, dict[str, object]],
+) -> Optional[TableInfo]:
+    """Convert a raw table dict to a TableInfo, filtering trivial tables."""
+    cells = raw.get("cells", set())
+    if len(cells) <= 1:
+        return None
+
+    rows_in = sorted({r for r, c in cells})
+    if len(rows_in) <= 1:
+        return None
+
+    header_row = rows_in[0]
+    data_end = rows_in[-1]
+
+    # Detect if first row is a title (1-2 text cells, no header keywords)
+    # rather than a real data/header row. E.g. "工程分年度投资输入表"
+    first_row_data = rows.get(header_row, {})
+    first_vals = [v for v in first_row_data.values() if v is not None]
+    first_str_vals = [v for v in first_vals if isinstance(v, str) and v.strip()]
+    first_num_vals = [v for v in first_vals
+                     if isinstance(v, (int, float)) and not isinstance(v, bool)
+                     and not _is_excel_date_serial(v)]
+    first_has_header_kw = any(
+        any(kw in (str(v) if v else "") for kw in _SEQ_KEYWORDS | _NAME_KEYWORDS | _CATEGORY_KEYWORDS)
+        for v in first_vals
+    )
+    if (len(first_vals) <= 2 and len(first_str_vals) >= 1
+            and len(first_num_vals) == 0 and not first_has_header_kw
+            and len(rows_in) >= 3):
+        # First row is a title — promote it and advance header
+        title = first_str_vals[0]
+        header_row = rows_in[1]
+        header_data = rows.get(header_row, {})
+    else:
+        title = None  # Will be determined by title search or fallback below
+        header_data = first_row_data
+
+    # Determine whether this is a header row or data-first row.
+    # L-tables may have no column header — e.g. anchor text + field-value pairs.
+    num_count = sum(1 for v in header_data.values()
+                    if isinstance(v, (int, float)) and not isinstance(v, bool)
+                    and not _is_excel_date_serial(v))
+    date_count = sum(1 for v in header_data.values() if _is_excel_date_serial(v))
+    header_labels = sum(1 for v in header_data.values()
+                       if isinstance(v, str) and v.strip()
+                       and any(kw in v for kw in _SEQ_KEYWORDS | _NAME_KEYWORDS | _CATEGORY_KEYWORDS))
+    has_proper_header = (
+        header_labels >= 3
+        or (len(header_data) >= 5 and num_count > 0)
+        or (date_count >= 3 and len(header_data) >= 3)
+    )
+    if has_proper_header:
+        data_start = header_row + 1
+    elif num_count > 0 and len(header_data) > 2:
+        # Numeric header row (unusual but possible)
+        data_start = header_row
+    else:
+        # No proper header — data starts at header_row (L-table label-value pattern)
+        data_start = header_row
+
+    if data_start > data_end:
+        return None
+
+    # Require at least 2 rows of actual data (filter single-row orphans)
+    if data_end - data_start + 1 < 2:
+        return None
+
+    # Title search (if not already found from first-row promotion)
+    if not title:
+        for title_row_num in range(header_row - 1, max(header_row - 4, 0), -1):
             candidate = rows.get(title_row_num, {})
             vals = [v for v in candidate.values() if v is not None]
             str_vals = [v for v in vals if isinstance(v, str) and v.strip()]
@@ -194,99 +779,42 @@ def detect_tables(
                 title = str_vals[0]
                 break
 
-        tbl = TableInfo(sheet_name, hrow, data_start, data_end, title=title)
-        _classify_columns(tbl, rows)
-        tables.append(tbl)
+    # Fall back to anchor text if no title found above header
+    if not title:
+        title = raw.get("title_text")
 
-    return tables
-
-
-def _keyword_categories(str_values: list) -> set[str]:
-    """Return the set of keyword categories matched by a list of string values."""
-    cats: set[str] = set()
-    for v in str_values:
-        if any(kw in v for kw in _CATEGORY_KEYWORDS):
-            cats.add("cat")
-        if any(kw in v for kw in _SEQ_KEYWORDS):
-            cats.add("seq")
-        if any(kw in v for kw in _NAME_KEYWORDS):
-            cats.add("name")
-        if any(kw in v for kw in _UNIT_KEYWORDS):
-            cats.add("unit")
-        if any(kw in v for kw in _NOTES_KEYWORDS):
-            cats.add("notes")
-    return cats
+    start_col = raw.get("start_col")
+    end_col = raw.get("end_col")
+    tbl = TableInfo(sheet_name, header_row, data_start, data_end,
+                    title=title, start_col=start_col, end_col=end_col)
+    _classify_columns(tbl, rows)
+    return tbl
 
 
-def _find_header_rows(
-    rows: dict[int, dict[str, object]],
-    sorted_row_nums: list[int],
-) -> list[int]:
-    """Identify rows that serve as column headers.
-
-    Two cases qualify as a header row:
-    1. Text header: < 20% numeric values AND keywords from ≥ 2 distinct categories.
-    2. Time-series header: > 50% year/date-serial values AND at least 1 keyword category,
-       AND the row must be within the first 15 rows of the sheet (prevents data rows
-       with large financial values from being misidentified as date-serial headers).
-    """
-    header_rows = []
-    first_row = sorted_row_nums[0] if sorted_row_nums else 0
-
-    for rnum in sorted_row_nums:
-        row = rows[rnum]
-        if not row:
-            continue
-        values = list(row.values())
-        str_values = [v for v in values if isinstance(v, str) and v.strip()]
-        if not str_values:
-            continue
-
-        num_values = [
-            v for v in values
-            if isinstance(v, (int, float)) and not isinstance(v, bool)
-            and not _is_excel_date_serial(v) and not _is_year_value(v)
-        ]
-        date_serial_count = sum(1 for v in values if _is_excel_date_serial(v))
-        year_count = sum(1 for v in values if _is_year_value(v))
-        num_ratio = len(num_values) / len(values)
-        date_ratio = (date_serial_count + year_count) / len(values)
-
-        kw_cats = _keyword_categories(str_values)
-
-        is_text_header = num_ratio < 0.2 and len(kw_cats) >= 3
-        # Time-series headers only valid in the first 15 rows of the sheet
-        is_ts_header = (
-            date_ratio > 0.5
-            and len(kw_cats) >= 1
-            and (rnum - first_row) < 15
-        )
-
-        if is_text_header or is_ts_header:
-            header_rows.append(rnum)
-
-    return header_rows
-
+# --- Column classification ---
 
 def _classify_columns(tbl: TableInfo, rows: dict[int, dict[str, object]]) -> None:
-    """Classify each column's role based on header label and data values."""
     header_row = rows.get(tbl.header_row, {})
 
-    # Collect all columns that appear in data rows
     data_cols: set[str] = set()
     for rnum in range(tbl.data_start, tbl.data_end + 1):
         if rnum in rows:
             data_cols.update(rows[rnum].keys())
     data_cols.update(header_row.keys())
 
+    # Restrict to the table's column bounds if known
+    if tbl.start_col and tbl.end_col:
+        sc_idx = column_index_from_string(tbl.start_col)
+        ec_idx = column_index_from_string(tbl.end_col)
+        data_cols = {c for c in data_cols
+                     if sc_idx <= column_index_from_string(c) <= ec_idx}
+
     for col in sorted(data_cols, key=lambda c: column_index_from_string(c)):
         label = header_row.get(col)
         label_str = str(label).strip() if label is not None else ""
 
-        # Check header label first
         role = _role_from_label(label_str)
 
-        # If label is a date serial or year, it's a time_series column
         if role == ColRole.UNKNOWN and label is not None:
             if _is_excel_date_serial(label):
                 role = ColRole.TIME_SERIES
@@ -295,7 +823,6 @@ def _classify_columns(tbl: TableInfo, rows: dict[int, dict[str, object]]) -> Non
                 role = ColRole.TIME_SERIES
                 tbl.time_period_labels[col] = str(int(label))
 
-        # Fallback: sample data values to infer role
         if role == ColRole.UNKNOWN:
             role = _role_from_data(col, tbl, rows)
 
@@ -328,7 +855,6 @@ def _role_from_label(label: str) -> str:
 
 
 def _role_from_data(col: str, tbl: TableInfo, rows: dict[int, dict[str, object]]) -> str:
-    """Infer column role by sampling data values."""
     sample = []
     for rnum in range(tbl.data_start, min(tbl.data_start + 10, tbl.data_end + 1)):
         if rnum in rows and col in rows[rnum]:
@@ -346,6 +872,6 @@ def _role_from_data(col: str, tbl: TableInfo, rows: dict[int, dict[str, object]]
     if seq_count > len(sample) * 0.5:
         return ColRole.SEQUENCE
     if num_count > len(sample) * 0.5:
-        return ColRole.TOTAL  # numeric column without header label -> likely value/total
+        return ColRole.TOTAL
 
     return ColRole.UNKNOWN

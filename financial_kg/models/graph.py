@@ -55,13 +55,33 @@ class FinancialGraph:
 
     # ── Stats ────────────────────────────────────────────────────────────────
 
+    # ── Orphan cells (no table association) ─────────────────────────────────
+
+    def get_unlinked_cells(self) -> dict[str, list[str]]:
+        """Return cells without table_id, grouped by sheet.
+
+        Returns {sheet_name: [cell_id, ...]} sorted by count descending.
+        """
+        by_sheet: dict[str, list[str]] = {}
+        for cid, cell in self.cells.items():
+            if cell.table_id is None:
+                by_sheet.setdefault(cell.sheet, []).append(cid)
+        return dict(sorted(by_sheet.items(), key=lambda x: -len(x[1])))
+
+    def unlinked_cell_count(self) -> int:
+        return sum(1 for c in self.cells.values() if c.table_id is None)
+
+    # ── Stats ────────────────────────────────────────────────────────────────
+
     def stats(self) -> dict:
         formula_cells = sum(1 for c in self.cells.values() if c.formula_raw)
+        unlinked = self.unlinked_cell_count()
         return {
             "total_cells": len(self.cells),
             "formula_cells": formula_cells,
             "dependency_edges": self.cell_graph.number_of_edges(),
             "total_indicators": len(self.indicators),
             "total_tables": len(self.tables),
+            "unlinked_cells": unlinked,
             "sheets": list({c.sheet for c in self.cells.values()}),
         }
