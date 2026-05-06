@@ -16,6 +16,14 @@ from financial_kg.viz.graph_viz import (
     build_indicator_subgraph,
     build_table_graph,
 )
+from financial_kg.viz.echarts_graph import (
+    build_cell_subgraph_data,
+    build_indicator_cell_graph_data,
+    build_indicator_subgraph_data,
+    build_table_graph_data,
+)
+from financial_kg.viz.echarts_template import render_graph_html
+import json
 
 st.title("🔍 图谱浏览")
 
@@ -119,9 +127,36 @@ if nav["indicator"]:
 
 # ── Main area ─────────────────────────────────────────────────────────────────
 
+# ── Render engine toggle ──────────────────────────────────────────────────────
+_ENGINE_KEY = f"viz_engine_{task.id}"
+if _ENGINE_KEY not in st.session_state:
+    st.session_state[_ENGINE_KEY] = "pyvis"
+
+st.sidebar.header("渲染引擎")
+st.session_state[_ENGINE_KEY] = st.sidebar.radio(
+    "选择渲染引擎",
+    ["pyvis", "echarts"],
+    format_func=lambda x: "Pyvis (vis.js)" if x == "pyvis" else "ECharts (可切换布局)",
+    index=0 if st.session_state[_ENGINE_KEY] == "pyvis" else 1,
+    label_visibility="collapsed",
+)
+
 def _render_html(path: str, height: int = 640) -> None:
     with open(path, encoding="utf-8") as f:
         components.html(f.read(), height=height, scrolling=False)
+
+
+def _render_echarts(data: dict, height: int = 640, layout: str = "force") -> None:
+    html = render_graph_html(json.dumps(data, ensure_ascii=False, default=str), height=f"{height}px")
+    components.html(html, height=height, scrolling=False)
+
+
+def _render_graph(pyvis_builder, data_builder, *args, height: int = 640, layout: str = "force", **kwargs):
+    engine = st.session_state[_ENGINE_KEY]
+    if engine == "pyvis":
+        _render_html(pyvis_builder(*args, **kwargs), height=height)
+    else:
+        _render_echarts(data_builder(*args, **kwargs), height=height, layout=layout)
 
 
 # Cell level
@@ -136,7 +171,11 @@ if nav["cell"]:
     depth = st.slider("展开深度", 1, 5, 2)
     if st.button("生成依赖子图"):
         with st.spinner("渲染中..."):
-            _render_html(build_cell_subgraph(graph, nav["cell"], depth=depth))
+            _render_graph(
+                build_cell_subgraph, build_cell_subgraph_data,
+                graph, nav["cell"],
+                depth=depth,
+            )
 
 # Indicator level
 elif nav["indicator"]:
@@ -171,7 +210,10 @@ elif nav["indicator"]:
 
     if st.button("生成 Cell 关系图"):
         with st.spinner("渲染中..."):
-            _render_html(build_indicator_cell_graph(graph, nav["indicator"]))
+            _render_graph(
+                build_indicator_cell_graph, build_indicator_cell_graph_data,
+                graph, nav["indicator"],
+            )
 
 # Table level
 elif nav["table"]:
@@ -204,7 +246,10 @@ elif nav["table"]:
 
     if st.button("生成指标关系图"):
         with st.spinner("渲染中..."):
-            _render_html(build_indicator_subgraph(graph, nav["table"]))
+            _render_graph(
+                build_indicator_subgraph, build_indicator_subgraph_data,
+                graph, nav["table"],
+            )
 
 # Sheet level
 elif nav["sheet"]:
@@ -242,7 +287,10 @@ elif nav["sheet"]:
 
     if st.button("生成表间关系图"):
         with st.spinner("渲染中..."):
-            _render_html(build_table_graph(graph, nav["sheet"]))
+            _render_graph(
+                build_table_graph, build_table_graph_data,
+                graph, nav["sheet"],
+            )
 
 # Overview (no selection)
 else:
