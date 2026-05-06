@@ -194,6 +194,8 @@ class TableInfo:
         self.col_roles: dict[str, str] = {}
         self.col_labels: dict[str, str] = {}
         self.time_period_labels: dict[str, str] = {}
+        self.header_rows: list[int] = []  # Pre-computed header rows (set during inheritance)
+        self.physical_header_row: Optional[int] = None  # Original detected header row (for ID generation)
 
     def name_col(self) -> Optional[str]:
         for col, role in self.col_roles.items():
@@ -532,21 +534,80 @@ def detect_tables(
     # inherit column metadata from the nearest table above on the same sheet.
     # Tables that already have their own col_roles (e.g. small sub-tables like
     # J-N repayment options) are left as-is to avoid inheriting wrong metadata.
+    #
+    # Additionally, sub-tables whose "header row" is actually a data row mimicking
+    # the main table's column structure (e.g. 表5 rows 104/115/129 with
+    # 序号=1, 项目=现金流入, 合计=value, 单位=万元) inherit the real header_row
+    # and column metadata from the donor table.
+    def _is_data_like_header(tbl: TableInfo, rows_data: dict) -> bool:
+        """Detect if a table's header row is actually a data row mimicking
+        the parent table's column structure (序号/项目/合计/单位 pattern)."""
+        hdr = rows_data.get(tbl.header_row, {})
+        if len(hdr) < 4:
+            return False
+        # Must have: (1) a sequence-like numeric in left columns, OR enough
+        # columns spanning the table's time-series range,
+        # (2) a string label in column C/D range,
+        # (3) a unit string.
+        left_cols = sorted(hdr.keys(), key=column_index_from_string)
+        left_3 = left_cols[:4]
+        has_seq = any(
+            isinstance(hdr.get(c), (int, float)) and hdr[c] in (1, 1.0)
+            for c in left_3
+        )
+        has_name = any(
+            isinstance(hdr.get(c), str) and len(str(hdr[c]).strip()) > 1
+            for c in left_3
+            if not any(kw in str(hdr.get(c, '')) for kw in _SEQ_KEYWORDS | _UNIT_KEYWORDS)
+        )
+        has_unit = any(
+            isinstance(hdr.get(c), str) and str(hdr[c]).strip() in _UNIT_KEYWORDS
+            for c in left_3
+        )
+        # Check: leftmost columns have data extending into the time-series range.
+        # E.g. 表9 Row 65: C=name, E=unit, F-N=time series data.
+        # F is column index 6, meaning data spans the time-series range.
+        max_col_idx = max(column_index_from_string(c) for c in hdr)
+        has_wide_span = max_col_idx >= 14  # At least up to column N
+        # Pattern A: 序号=1 + name + unit (表5 sub-tables)
+        pattern_a = has_seq and has_name and has_unit
+        # Pattern B: name + unit + wide data span, missing 序号 (表9 sub-tables)
+        pattern_b = has_name and has_unit and has_wide_span
+        return pattern_a or pattern_b
+
     donors: list[TableInfo] = []
     for tbl in result:
+        # Track the original detected header row for ID generation
+        tbl.physical_header_row = tbl.header_row
         has_ts = any(r == ColRole.TIME_SERIES for r in tbl.col_roles.values())
         if has_ts:
             donors.append(tbl)
-        elif len(tbl.col_roles) <= 2:
+        else:
+            # Find nearest donor table above
             best = None
             for d in donors:
                 if d.data_end < tbl.header_row:
                     if best is None or d.data_end > best.data_end:
                         best = d
             if best is not None:
-                tbl.col_roles = dict(best.col_roles)
-                tbl.col_labels = dict(best.col_labels)
-                tbl.time_period_labels = dict(best.time_period_labels)
+                should_inherit = len(tbl.col_roles) <= 2
+                is_data_header = False
+                if not should_inherit:
+                    is_data_header = _is_data_like_header(tbl, rows)
+                    should_inherit = is_data_header
+                if should_inherit:
+                    tbl.col_roles = dict(best.col_roles)
+                    tbl.col_labels = dict(best.col_labels)
+                    tbl.time_period_labels = dict(best.time_period_labels)
+                    tbl.header_row = best.header_row
+                    # For data-like header: the "header" row is actually data,
+                    # so back up data_start by 1 to include it.
+                    if is_data_header:
+                        tbl.data_start = tbl.data_start - 1
+                    # Pre-compute header_rows so indicator_builder doesn't
+                    # generate a massive range from inherited header_row to
+                    # the sub-table's data_start.
+                    tbl.header_rows = [best.header_row]
 
     # --- Phase 6: Per-sheet numbering and title formatting ---
     for idx, tbl in enumerate(result, 1):
@@ -1011,6 +1072,10 @@ def _raw_to_table_info(
 
     # Two-row merged header: if header row cells are merged into the next row,
     # advance data_start past the merged continuation (e.g. rows 261-262).
+    # But only if the next row has REAL content — skip if it's just a numbering
+    # row (1, 2, 3...) with no label cells. This avoids over-advancing for tables
+    # where header labels are cosmetically merged across 2 visual rows but the
+    # numbering row is a separate logical row (e.g. 表4-收入税金表 rows 65-67).
     if has_proper_header and cell_list:
         merge_into_next = 0
         label_cols_in_header = 0
@@ -1020,8 +1085,22 @@ def _raw_to_table_info(
                     merge_into_next += 1
                 if column_index_from_string(cd.col) <= column_index_from_string("E"):
                     label_cols_in_header += 1
-        # Multiple label-column cells merged into next row → two-row header
-        if merge_into_next >= 3 and label_cols_in_header >= 2:
+        # Check if the next row has substantive content (label cells or mixed data)
+        # vs just a numbering row (1, 2, 3, ...).
+        next_row_data = rows.get(header_row + 1, {})
+        next_has_labels = any(
+            column_index_from_string(c) <= column_index_from_string("E")
+            and isinstance(next_row_data.get(c), str)
+            and any(kw in str(next_row_data[c]) for kw in _SEQ_KEYWORDS | _NAME_KEYWORDS | _CATEGORY_KEYWORDS)
+            for c in next_row_data
+        )
+        next_all_numeric = all(
+            isinstance(next_row_data.get(c), (int, float))
+            for c in next_row_data
+            if column_index_from_string(c) > column_index_from_string("E")
+        ) and len([c for c in next_row_data if column_index_from_string(c) > column_index_from_string("E")]) > 2
+        # Only advance past merged row if it has label content OR isn't just a pure numbering row
+        if merge_into_next >= 3 and label_cols_in_header >= 2 and (next_has_labels or not next_all_numeric):
             data_start = header_row + 2
 
     if data_start > data_end:

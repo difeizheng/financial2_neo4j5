@@ -40,7 +40,9 @@ def _make_table_id(sheet: str, tbl: "TableInfo") -> str:
     col_suffix = f"_{tbl.start_col}" if tbl.start_col else ""
     # Add end_col to distinguish overlapping tables with same header_row+start_col
     end_suffix = f"_{tbl.end_col}" if tbl.end_col and tbl.start_col and tbl.end_col != tbl.start_col else ""
-    return f"TBL_{sheet}_{tbl.header_row}{col_suffix}{end_suffix}"
+    # Use physical_header_row (original detected row) for unique IDs
+    hdr = tbl.physical_header_row if tbl.physical_header_row else tbl.header_row
+    return f"TBL_{sheet}_{hdr}{col_suffix}{end_suffix}"
 
 
 def _make_readable_formula(formula_raw: str, graph: FinancialGraph) -> str:
@@ -233,9 +235,13 @@ def _process_table(
     else:
         table_type = "calculation"
 
-    # All header rows (header_row to data_start-1, at least 1 row)
-    header_end = max(tbl.data_start, tbl.header_row + 1)
-    all_header_rows = list(range(tbl.header_row, header_end))
+    # All header rows: use pre-computed if set (from Phase 5.6 inheritance),
+    # otherwise compute from header_row to data_start-1.
+    if tbl.header_rows:
+        all_header_rows = list(tbl.header_rows)
+    else:
+        header_end = max(tbl.data_start, tbl.header_row + 1)
+        all_header_rows = list(range(tbl.header_row, header_end))
     ts_cols_set = set(ts_cols)
 
     # If a title row exists just above header_row and has data in the
