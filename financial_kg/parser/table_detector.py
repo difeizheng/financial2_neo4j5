@@ -703,11 +703,26 @@ def _expand_l_table(
             if len(non_empty) == 1 and all(isinstance(v, str) and not v.strip().isdigit() for v in non_empty):
                 break
             # New L-table section: anchor column has a different merge parent
+            # BUT only if the resumed row looks like a sub-table header area
+            # (data confined to anchor columns) rather than a full-width data row.
+            # E.g. 参数输入表 row 379 has data across B-K (same table continues),
+            # while 表1 row 46 only has B-D (new sub-table "季度还款" header).
             if merge_parent_at:
                 anchor_parent = anchor.get("parent_id")
                 resume_parent = merge_parent_at.get((current_row, ac))
                 if resume_parent and resume_parent != anchor_parent:
-                    break
+                    # Check if data is confined to anchor-column area (narrow)
+                    # or spans full table width (wide → same table continues).
+                    row_max_col_idx = 0
+                    for c in row_data:
+                        ci = column_index_from_string(c)
+                        if ci > row_max_col_idx:
+                            row_max_col_idx = ci
+                    anchor_col_idx = column_index_from_string(ac)
+                    # If data extends more than 3 columns past anchor, it's a
+                    # full-width data row — same table, don't break.
+                    if row_max_col_idx <= anchor_col_idx + 3:
+                        break
 
         consecutive_empty = 0
 

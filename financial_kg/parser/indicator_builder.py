@@ -36,8 +36,11 @@ def _make_indicator_id(sheet: str, row: int, name: str, category: str) -> str:
     return f"IND_{sheet}_{row}_{cat}_{clean}".replace(" ", "_")
 
 
-def _make_table_id(sheet: str, header_row: int) -> str:
-    return f"TBL_{sheet}_{header_row}"
+def _make_table_id(sheet: str, tbl: "TableInfo") -> str:
+    col_suffix = f"_{tbl.start_col}" if tbl.start_col else ""
+    # Add end_col to distinguish overlapping tables with same header_row+start_col
+    end_suffix = f"_{tbl.end_col}" if tbl.end_col and tbl.start_col and tbl.end_col != tbl.start_col else ""
+    return f"TBL_{sheet}_{tbl.header_row}{col_suffix}{end_suffix}"
 
 
 def _make_readable_formula(formula_raw: str, graph: FinancialGraph) -> str:
@@ -74,7 +77,7 @@ def build_indicators(
         tables = detect_tables(sheet_name, rows, cell_list=cell_list)
 
         for tbl in tables:
-            table_id = _make_table_id(sheet_name, tbl.header_row)
+            table_id = _make_table_id(sheet_name, tbl)
             _process_table(tbl, table_id, sheet_name, rows, cell_list, graph)
 
 
