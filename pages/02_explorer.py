@@ -217,12 +217,20 @@ elif nav["sheet"]:
         st.subheader(f"Table 列表（{len(tables_in_sheet)} 个）")
         rows = []
         for tbl in tables_in_sheet:
+            header_rows = sorted(tbl.header_rows)
+            if not header_rows:
+                header_display = "—"
+            elif len(header_rows) == 1:
+                header_display = str(header_rows[0])
+            else:
+                header_display = f"{header_rows[0]}–{header_rows[-1]}"
+            ts_cols = len(tbl.time_period_labels)
             rows.append({
                 "名称": tbl.name,
                 "类型": tbl.table_type,
                 "行范围": f"{tbl.data_row_range[0]}–{tbl.data_row_range[1]}" if tbl.data_row_range else "—",
-                "表头行": len(tbl.header_rows),
-                "时间行": tbl.time_header_rows,
+                "表头行": header_display,
+                "时间序列列": ts_cols if ts_cols else "—",
                 "Indicator": len(tbl.indicator_ids),
                 "上游 Table": len(tbl.fed_by),
                 "下游 Table": len(tbl.feeds_into),

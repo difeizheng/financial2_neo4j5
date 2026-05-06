@@ -528,14 +528,16 @@ def detect_tables(
             result.append(tbl)
 
     # --- Phase 5.6: Header inheritance ---
-    # Tables without TIME_SERIES columns inherit column metadata from the
-    # nearest table above on the same sheet that has them.
+    # Tables without TIME_SERIES columns AND with ≤2 own col_roles
+    # inherit column metadata from the nearest table above on the same sheet.
+    # Tables that already have their own col_roles (e.g. small sub-tables like
+    # J-N repayment options) are left as-is to avoid inheriting wrong metadata.
     donors: list[TableInfo] = []
     for tbl in result:
         has_ts = any(r == ColRole.TIME_SERIES for r in tbl.col_roles.values())
         if has_ts:
             donors.append(tbl)
-        else:
+        elif len(tbl.col_roles) <= 2:
             best = None
             for d in donors:
                 if d.data_end < tbl.header_row:
