@@ -1,5 +1,5 @@
 from __future__ import annotations
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from typing import Optional
 
 
@@ -20,6 +20,7 @@ class Table:
     indicator_ids: list[str] = field(default_factory=list)
     # col_letter -> period label (for time_series columns)
     time_period_labels: dict = field(default_factory=dict)
+    time_header_rows: int = 0  # number of header rows containing time period data
     # Populated after relationship inference
     feeds_into: list[str] = field(default_factory=list)    # table ids this feeds into
     fed_by: list[str] = field(default_factory=list)        # table ids that feed this
@@ -35,6 +36,7 @@ class Table:
             "data_row_range": self.data_row_range,
             "col_roles": self.col_roles,
             "time_period_labels": self.time_period_labels,
+            "time_header_rows": self.time_header_rows,
             "indicator_ids": self.indicator_ids,
             "feeds_into": self.feeds_into,
             "fed_by": self.fed_by,
@@ -42,5 +44,8 @@ class Table:
 
     @classmethod
     def from_dict(cls, d: dict) -> "Table":
+        valid = {f.name for f in fields(cls)}
+        d = {k: v for k, v in d.items() if k in valid}
         d.setdefault("time_period_labels", {})
+        d.setdefault("time_header_rows", 0)
         return cls(**d)

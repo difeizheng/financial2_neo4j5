@@ -167,9 +167,13 @@ def _process_table(
         # ── Extract time series ──────────────────────────────────────────────
         time_series: dict[str, Any] = {}
         for ts_col in ts_cols:
+            period_label = tbl.time_period_labels.get(ts_col, ts_col)
             if ts_col in row:
-                period_label = tbl.time_period_labels.get(ts_col, ts_col)
                 time_series[period_label] = row[ts_col]
+            # Assign time_period to the cell in this TIME_SERIES column
+            cid = f"{sheet_name}_{row_num}_{ts_col}"
+            if cid in graph.cells:
+                graph.cells[cid].time_period = period_label
 
         # ── Collect all cell IDs for this row ────────────────────────────────
         cell_ids = [
@@ -226,15 +230,42 @@ def _process_table(
     else:
         table_type = "calculation"
 
+    # All header rows (header_row to data_start-1, at least 1 row)
+    header_end = max(tbl.data_start, tbl.header_row + 1)
+    all_header_rows = list(range(tbl.header_row, header_end))
+    ts_cols_set = set(ts_cols)
+
+    # If a title row exists just above header_row and has data in the
+    # table's time columns, include it as a header row (e.g. "资金筹措表" row).
+    if tbl.title and tbl.header_row > 1:
+        title_row = tbl.header_row - 1
+        row_above = rows.get(title_row, {})
+        if row_above:
+            left_texts = [v for c, v in row_above.items()
+                          if column_index_from_string(c) <= column_index_from_string("E")
+                          and isinstance(v, str) and v.strip()]
+            has_data = any(column_index_from_string(c) > column_index_from_string("E")
+                          and row_above[c] is not None for c in row_above)
+            if len(left_texts) == 1 and has_data:
+                all_header_rows.insert(0, title_row)
+
+    # Count how many header rows contain time period data
+    time_header_rows = 0
+    for hr in all_header_rows:
+        row_data = rows.get(hr, {})
+        if any(col in ts_cols_set and row_data.get(col) is not None for col in row_data):
+            time_header_rows += 1
+
     table = Table(
         id=table_id,
         name=tbl.title or sheet_name,
         sheet=sheet_name,
         table_type=table_type,
-        header_rows=[tbl.header_row],
+        header_rows=all_header_rows,
         data_row_range=[tbl.data_start, tbl.data_end],
         col_roles=tbl.col_roles,
         time_period_labels=tbl.time_period_labels,
+        time_header_rows=time_header_rows,
         indicator_ids=indicator_ids,
     )
     graph.add_table(table)

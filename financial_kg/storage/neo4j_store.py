@@ -144,6 +144,7 @@ class Neo4jStore:
                         "is_header": c.is_header,
                         "indicator_id": c.indicator_id,
                         "table_id": c.table_id,
+                        "time_period": c.time_period,
                         "orig_id": c.id,  # Store original ID for reference
                     }
                     for c in batch
@@ -152,7 +153,8 @@ class Neo4jStore:
                     "UNWIND $rows AS r "
                     "CREATE (n:Cell {id: r.id, task_id: r.task_id, sheet: r.sheet, row: r.row, col: r.col, "
                     "value: r.value, formula_raw: r.formula_raw, data_type: r.data_type, "
-                    "is_header: r.is_header, indicator_id: r.indicator_id, table_id: r.table_id, orig_id: r.orig_id})",
+                    "is_header: r.is_header, indicator_id: r.indicator_id, table_id: r.table_id, "
+                    "time_period: r.time_period, orig_id: r.orig_id})",
                     rows=rows,
                 )
                 total += result.consume().counters.nodes_created

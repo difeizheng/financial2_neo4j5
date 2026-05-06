@@ -50,6 +50,112 @@ def _is_year_value(v) -> bool:
     return isinstance(v, (int, float)) and 2000 <= v <= 2100 and v == int(v)
 
 
+# ── Time label parsing ─────────────────────────────────────────────────────────
+
+# Patterns for detecting time strings in headers
+_RE_YEAR_ONLY = re.compile(r"^(?:FY\s*)?(\d{4})(?:年|年度)?$")
+_RE_YEAR_MONTH_ISO = re.compile(r"^(\d{4})[-./](\d{1,2})$")
+_RE_YEAR_MONTH_CN = re.compile(r"^(\d{4})年(\d{1,2})月$")
+_RE_YMD_ISO = re.compile(r"^(\d{4})[-./](\d{1,2})[-./](\d{1,2})$")
+_RE_YMD_CN = re.compile(r"^(\d{4})年(\d{1,2})月(\d{1,2})日$")
+
+_MONTH_NAMES_EN: dict[str, int] = {
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+    "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+    "january": 1, "february": 2, "march": 3, "april": 4, "may": 5, "june": 6,
+    "july": 7, "august": 8, "september": 9, "october": 10, "november": 11, "december": 12,
+}
+_RE_MONTH_YEAR_EN = re.compile(r"^([A-Za-z]+)[-\s](\d{4})$")
+
+
+def _parse_time_label(value, number_format: Optional[str] = None) -> Optional[str]:
+    """Detect and normalize a time period label from a header cell value.
+
+    Returns an ISO 8601 label: "2024" (year), "2024-01" (year-month),
+    "2024-01-15" (year-month-day), or None if not recognized.
+    """
+    from .format_utils import is_date_format, serial_to_datetime, _format_date_by_pattern
+
+    if value is None:
+        return None
+
+    # 1. Excel date serial (integer in typical date range, e.g. 45658 = 2025-01-01)
+    if _is_excel_date_serial(value):
+        dt = serial_to_datetime(float(value))
+        if number_format and is_date_format(number_format):
+            return _format_date_by_pattern(dt, number_format)
+        return dt.strftime("%Y-%m")
+
+    # 2. Numeric: year value or date-formatted number
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        v = float(value)
+        if number_format and is_date_format(number_format):
+            try:
+                dt = serial_to_datetime(v)
+                return _format_date_by_pattern(dt, number_format)
+            except Exception:
+                pass
+        if v == int(v) and 2000 <= v <= 2100:
+            return str(int(v))
+        return None
+
+    # 3. String pattern matching
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return None
+        return _parse_time_string(s)
+
+    return None
+
+
+def _parse_time_string(s: str) -> Optional[str]:
+    """Parse a time period string into ISO 8601 format."""
+    # Year-Month-Day: "2024-01-15" or "2024/01/15" or "2024.01.15"
+    m = _RE_YMD_ISO.match(s)
+    if m:
+        return f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
+
+    # Year-Month-Day CN: "2024年1月15日"
+    m = _RE_YMD_CN.match(s)
+    if m:
+        return f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
+
+    # Year-Month: "2024-01" or "2024.01" or "2024/01"
+    m = _RE_YEAR_MONTH_ISO.match(s)
+    if m:
+        return f"{m.group(1)}-{int(m.group(2)):02d}"
+
+    # Year-Month CN: "2024年1月"
+    m = _RE_YEAR_MONTH_CN.match(s)
+    if m:
+        return f"{m.group(1)}-{int(m.group(2)):02d}"
+
+    # Year only: "2024", "2024年", "2024年度", "FY2024", "FY 2024"
+    m = _RE_YEAR_ONLY.match(s)
+    if m:
+        return m.group(1)
+
+    # Month-Year EN: "Jan-2024", "January 2024"
+    m = _RE_MONTH_YEAR_EN.match(s)
+    if m:
+        mon = _MONTH_NAMES_EN.get(m.group(1).lower())
+        if mon is not None:
+            return f"{m.group(2)}-{mon:02d}"
+
+    # Short year EN: "Jan-24" → "2024-01"
+    # Only match if it looks like a date abbreviation
+    m_short = re.match(r"^([A-Za-z]{3,})[-\s](\d{2})$", s)
+    if m_short:
+        mon = _MONTH_NAMES_EN.get(m_short.group(1).lower())
+        if mon is not None:
+            yr = int(m_short.group(2))
+            yr = 2000 + yr if yr < 70 else 1900 + yr
+            return f"{yr}-{mon:02d}"
+
+    return None
+
+
 def _looks_like_sequence(v) -> bool:
     if isinstance(v, (int, float)):
         return 0 < v < 1000
@@ -290,6 +396,12 @@ def detect_tables(
     merge_groups = _build_merge_groups(cell_list) if cell_list else {}
     anchors = _find_vertical_anchors(merge_groups, rows, sheet_name)
 
+    # Build lookup: (row, col) -> merge parent_id for detecting L-table boundaries
+    merge_parent_at: dict[tuple[int, str], str] = {}
+    for pid, mg in merge_groups.items():
+        for r, c in mg["cells"]:
+            merge_parent_at[(r, c)] = pid
+
     max_row = max(rows.keys())
     all_cols = set()
     for row_data in rows.values():
@@ -340,7 +452,7 @@ def detect_tables(
                         tables.append(sub)
 
         table_info = _expand_l_table(
-            a, rows, visited, max_row, max_col, recognized_ranges,
+            a, rows, visited, max_row, max_col, recognized_ranges, merge_parent_at,
         )
         if table_info is None:
             continue
@@ -411,9 +523,28 @@ def detect_tables(
     # --- Phase 5: Convert to TableInfo and filter ---
     result: list[TableInfo] = []
     for raw in tables:
-        tbl = _raw_to_table_info(sheet_name, raw, rows)
+        tbl = _raw_to_table_info(sheet_name, raw, rows, cell_list)
         if tbl is not None:
             result.append(tbl)
+
+    # --- Phase 5.6: Header inheritance ---
+    # Tables without TIME_SERIES columns inherit column metadata from the
+    # nearest table above on the same sheet that has them.
+    donors: list[TableInfo] = []
+    for tbl in result:
+        has_ts = any(r == ColRole.TIME_SERIES for r in tbl.col_roles.values())
+        if has_ts:
+            donors.append(tbl)
+        else:
+            best = None
+            for d in donors:
+                if d.data_end < tbl.header_row:
+                    if best is None or d.data_end > best.data_end:
+                        best = d
+            if best is not None:
+                tbl.col_roles = dict(best.col_roles)
+                tbl.col_labels = dict(best.col_labels)
+                tbl.time_period_labels = dict(best.time_period_labels)
 
     # --- Phase 6: Per-sheet numbering and title formatting ---
     for idx, tbl in enumerate(result, 1):
@@ -486,6 +617,7 @@ def _expand_l_table(
     visited: set,
     max_row: int, max_col: str,
     recognized_ranges: list,
+    merge_parent_at: dict | None = None,
 ) -> dict | None:
     """Expand an L-shaped table from a vertical anchor.
 
@@ -570,6 +702,12 @@ def _expand_l_table(
             non_empty = [v for v in row_data.values() if v is not None]
             if len(non_empty) == 1 and all(isinstance(v, str) and not v.strip().isdigit() for v in non_empty):
                 break
+            # New L-table section: anchor column has a different merge parent
+            if merge_parent_at:
+                anchor_parent = anchor.get("parent_id")
+                resume_parent = merge_parent_at.get((current_row, ac))
+                if resume_parent and resume_parent != anchor_parent:
+                    break
 
         consecutive_empty = 0
 
@@ -702,6 +840,7 @@ def _merge_adjacent_tables(
 def _raw_to_table_info(
     sheet_name: str, raw: dict,
     rows: dict[int, dict[str, object]],
+    cell_list: list | None = None,
 ) -> Optional[TableInfo]:
     """Convert a raw table dict to a TableInfo, filtering trivial tables."""
     cells = raw.get("cells", set())
@@ -714,6 +853,74 @@ def _raw_to_table_info(
 
     header_row = rows_in[0]
     data_end = rows_in[-1]
+
+    # Absorb orphan rows above the detected table that are disconnected
+    # due to merged cells (e.g. two-row header where row N+1 has empty B-E).
+    if cell_list:
+        # Compute max column in this table for overlap detection
+        table_cols = {c for _, c in cells}
+        if table_cols:
+            max_col_idx = max(column_index_from_string(c) for c in table_cols)
+        else:
+            max_col_idx = 0
+
+        # Keep absorbing rows above until no more orphan rows are found
+        # (max 10 iterations as a safety limit)
+        absorbed = True
+        _max_iter = 10
+        while absorbed and header_row > 1 and _max_iter > 0:
+            _max_iter -= 1
+            check_row = header_row - 1
+            absorbed = False
+            # Check A: row has cells merged into or past the current header_row
+            merged_into_header = False
+            for cd in cell_list:
+                if cd.row == check_row and cd.merge_end_row is not None and cd.merge_end_row >= header_row - 1:
+                    merged_into_header = True
+                    break
+            # Check B: row is a thin continuation (no B-E data, has F+ data
+            # overlapping table columns) — typical for two-row header row N+1
+            thin_continuation = False
+            if not merged_into_header and check_row in rows:
+                rd = rows[check_row]
+                has_label = any(
+                    column_index_from_string(c) <= column_index_from_string("E")
+                    and rd[c] is not None
+                    for c in rd
+                )
+                has_data_cols = any(
+                    column_index_from_string(c) > column_index_from_string("E")
+                    and rd[c] is not None
+                    and column_index_from_string(c) <= max_col_idx + 3
+                    for c in rd
+                )
+                if not has_label and has_data_cols:
+                    thin_continuation = True
+            # Check C: row is a title-like row with table data in F+ columns
+            # (e.g. "资金筹措表" + time period counts row)
+            title_with_data = False
+            if not merged_into_header and not thin_continuation and check_row in rows:
+                rd = rows[check_row]
+                left_texts = [
+                    v for c, v in rd.items()
+                    if column_index_from_string(c) <= column_index_from_string("E")
+                    and isinstance(v, str) and v.strip()
+                ]
+                has_data = any(
+                    column_index_from_string(c) > column_index_from_string("E")
+                    and rd[c] is not None
+                    and column_index_from_string(c) <= max_col_idx + 3
+                    for c in rd
+                )
+                if len(left_texts) == 1 and not any(
+                    kw in (left_texts[0] if left_texts else "")
+                    for kw in _SEQ_KEYWORDS | _NAME_KEYWORDS | _CATEGORY_KEYWORDS | _TOTAL_KEYWORDS
+                ) and has_data:
+                    title_with_data = True
+
+            if merged_into_header or thin_continuation or title_with_data:
+                header_row = check_row
+                absorbed = True
 
     # Detect if first row is a title (1-2 text cells, no header keywords)
     # rather than a real data/header row. E.g. "工程分年度投资输入表"
@@ -754,12 +961,51 @@ def _raw_to_table_info(
     )
     if has_proper_header:
         data_start = header_row + 1
+        # Check if next row is an even better header (multi-row header scenario).
+        # Common pattern: row N has title + period numbers, row N+1 has
+        # "序号/项目/合计" keywords + Excel date serials.
+        next_row_num = data_start
+        if next_row_num in rows:
+            next_row = rows[next_row_num]
+            next_num = sum(1 for v in next_row.values()
+                          if isinstance(v, (int, float)) and not isinstance(v, bool)
+                          and not _is_excel_date_serial(v))
+            next_date = sum(1 for v in next_row.values() if _is_excel_date_serial(v))
+            next_labels = sum(1 for v in next_row.values()
+                             if isinstance(v, str) and v.strip()
+                             and any(kw in v for kw in _SEQ_KEYWORDS | _NAME_KEYWORDS | _CATEGORY_KEYWORDS))
+            if (next_labels > header_labels and next_labels >= 2) or \
+               (next_date >= 3 and next_date > date_count):
+                # Next row has stronger header signals — promote it
+                if not title and len(first_str_vals) >= 1:
+                    title = first_str_vals[0]
+                header_row = next_row_num
+                header_data = next_row
+                data_start = header_row + 1
+                num_count = next_num
+                date_count = next_date
+                header_labels = next_labels
     elif num_count > 0 and len(header_data) > 2:
         # Numeric header row (unusual but possible)
         data_start = header_row
     else:
         # No proper header — data starts at header_row (L-table label-value pattern)
         data_start = header_row
+
+    # Two-row merged header: if header row cells are merged into the next row,
+    # advance data_start past the merged continuation (e.g. rows 261-262).
+    if has_proper_header and cell_list:
+        merge_into_next = 0
+        label_cols_in_header = 0
+        for cd in cell_list:
+            if cd.row == header_row and cd.merge_end_row is not None:
+                if cd.merge_end_row >= header_row + 1:
+                    merge_into_next += 1
+                if column_index_from_string(cd.col) <= column_index_from_string("E"):
+                    label_cols_in_header += 1
+        # Multiple label-column cells merged into next row → two-row header
+        if merge_into_next >= 3 and label_cols_in_header >= 2:
+            data_start = header_row + 2
 
     if data_start > data_end:
         return None
@@ -787,14 +1033,21 @@ def _raw_to_table_info(
     end_col = raw.get("end_col")
     tbl = TableInfo(sheet_name, header_row, data_start, data_end,
                     title=title, start_col=start_col, end_col=end_col)
-    _classify_columns(tbl, rows)
+    _classify_columns(tbl, rows, cell_list)
     return tbl
 
 
 # --- Column classification ---
 
-def _classify_columns(tbl: TableInfo, rows: dict[int, dict[str, object]]) -> None:
+def _classify_columns(tbl: TableInfo, rows: dict[int, dict[str, object]],
+                     cell_list: list | None = None) -> None:
     header_row = rows.get(tbl.header_row, {})
+
+    # Build (row, col) -> CellData lookup for number_format access
+    cd_lookup: dict[tuple[int, str], object] = {}
+    if cell_list:
+        for cd in cell_list:
+            cd_lookup[(cd.row, cd.col)] = cd
 
     data_cols: set[str] = set()
     for rnum in range(tbl.data_start, tbl.data_end + 1):
@@ -816,12 +1069,16 @@ def _classify_columns(tbl: TableInfo, rows: dict[int, dict[str, object]]) -> Non
         role = _role_from_label(label_str)
 
         if role == ColRole.UNKNOWN and label is not None:
-            if _is_excel_date_serial(label):
+            # Get number_format for this header cell (if available)
+            hdr_fmt = None
+            cd = cd_lookup.get((tbl.header_row, col))
+            if cd is not None:
+                hdr_fmt = getattr(cd, "number_format", None)
+            # Try unified time label parser first
+            period = _parse_time_label(label, hdr_fmt)
+            if period is not None:
                 role = ColRole.TIME_SERIES
-                tbl.time_period_labels[col] = _excel_serial_to_label(label)
-            elif _is_year_value(label):
-                role = ColRole.TIME_SERIES
-                tbl.time_period_labels[col] = str(int(label))
+                tbl.time_period_labels[col] = period
 
         if role == ColRole.UNKNOWN:
             role = _role_from_data(col, tbl, rows)
@@ -871,6 +1128,10 @@ def _role_from_data(col: str, tbl: TableInfo, rows: dict[int, dict[str, object]]
         return ColRole.NAME
     if seq_count > len(sample) * 0.5:
         return ColRole.SEQUENCE
+    # If >50% of sampled values are Excel date serials → TIME_SERIES
+    date_count = sum(1 for v in sample if _is_excel_date_serial(v))
+    if date_count > len(sample) * 0.5:
+        return ColRole.TIME_SERIES
     if num_count > len(sample) * 0.5:
         return ColRole.TOTAL
 

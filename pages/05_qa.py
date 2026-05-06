@@ -16,7 +16,6 @@ from financial_kg.config import (
     save_config,
 )
 
-st.set_page_config(page_title="智能问答", layout="wide")
 st.title("💬 财务模型智能问答")
 
 db = TaskDB()

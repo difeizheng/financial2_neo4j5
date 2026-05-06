@@ -17,7 +17,6 @@ from financial_kg.viz.graph_viz import (
     build_table_graph,
 )
 
-st.set_page_config(page_title="图谱浏览", layout="wide")
 st.title("🔍 图谱浏览")
 
 # ── Task selector ─────────────────────────────────────────────────────────────
@@ -221,9 +220,12 @@ elif nav["sheet"]:
             rows.append({
                 "名称": tbl.name,
                 "类型": tbl.table_type,
-                "Indicator 数": len(tbl.indicator_ids),
-                "上游 Table 数": len(tbl.fed_by),
-                "下游 Table 数": len(tbl.feeds_into),
+                "行范围": f"{tbl.data_row_range[0]}–{tbl.data_row_range[1]}" if tbl.data_row_range else "—",
+                "表头行": len(tbl.header_rows),
+                "时间行": tbl.time_header_rows,
+                "Indicator": len(tbl.indicator_ids),
+                "上游 Table": len(tbl.fed_by),
+                "下游 Table": len(tbl.feeds_into),
             })
         st.dataframe(rows, use_container_width=True)
 

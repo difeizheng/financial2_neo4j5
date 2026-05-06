@@ -15,7 +15,6 @@ from financial_kg.engine.snapshot import load_snapshot, diff_snapshots
 from financial_kg.viz.propagation_graph import build_propagation_data
 from financial_kg.viz.echarts_template import render_propagation_html
 
-st.set_page_config(page_title="快照对比", layout="wide")
 st.title("📊 快照对比")
 
 db = TaskDB()

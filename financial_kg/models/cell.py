@@ -1,5 +1,5 @@
 from __future__ import annotations
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from typing import Any, Optional
 
 
@@ -43,6 +43,7 @@ class Cell:
     # Populated after indicator/table detection
     indicator_id: Optional[str] = None
     table_id: Optional[str] = None
+    time_period: Optional[str] = None  # e.g. "2024", "2024-01", "2024-01-15"
 
     def to_dict(self) -> dict:
         return {
@@ -61,9 +62,13 @@ class Cell:
             "dependents": self.dependents,
             "indicator_id": self.indicator_id,
             "table_id": self.table_id,
+            "time_period": self.time_period,
         }
 
     @classmethod
     def from_dict(cls, d: dict) -> "Cell":
-        d = {**d, "number_format": d.get("number_format")}
+        valid = {f.name for f in fields(cls)}
+        d = {k: v for k, v in d.items() if k in valid}
+        d.setdefault("number_format", None)
+        d.setdefault("time_period", None)
         return cls(**d)

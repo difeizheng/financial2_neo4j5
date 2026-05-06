@@ -154,6 +154,27 @@ class TaskDB:
             row = conn.execute("SELECT * FROM snapshots WHERE id=?", (snap_id,)).fetchone()
         return _row_to_snapshot(row) if row else None
 
+    # ── Delete ─────────────────────────────────────────────────────────────────
+
+    def delete_task(self, task_id: str) -> Optional[TaskRecord]:
+        """Delete a task, its snapshots, and return the task record for file cleanup.
+        Returns None if the task doesn't exist."""
+        task = self.get_task(task_id)
+        if task is None:
+            return None
+        with self._conn() as conn:
+            conn.execute("DELETE FROM snapshots WHERE task_id=?", (task_id,))
+            conn.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+        return task
+
+    def list_snapshot_files(self, task_id: str) -> list[str]:
+        """Return filepath for all snapshots of a task."""
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT filepath FROM snapshots WHERE task_id=?", (task_id,)
+            ).fetchall()
+        return [r[0] for r in rows]
+
 
 def _row_to_task(row) -> TaskRecord:
     return TaskRecord(

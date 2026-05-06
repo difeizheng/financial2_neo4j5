@@ -2,6 +2,7 @@
 from __future__ import annotations
 import os
 import sys
+import shutil
 import time
 import uuid
 import tempfile
@@ -18,7 +19,6 @@ from financial_kg.storage.json_store import save_graph, load_graph, verify_cell_
 from financial_kg.storage.task_db import TaskDB
 from financial_kg.config import NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD, save_config
 
-st.set_page_config(page_title="上传解析", layout="wide")
 st.title("📁 上传 Excel 财务模型")
 
 db = TaskDB()
@@ -101,13 +101,64 @@ if uploaded:
         finally:
             os.unlink(tmp_path)
 
+def _do_delete_task(db: TaskDB, t) -> None:
+    """Delete a task from DB and remove its output files + snapshot directory."""
+    output_dir = t.output_dir or "output"
+    prefix = t.id
+    snapshots_dir = os.path.join("snapshots", t.id)
+    deleted_files = []
+
+    # Remove output JSON files
+    for suffix in ["_cells.json", "_indicators.json", "_tables.json"]:
+        fp = os.path.join(output_dir, f"{prefix}{suffix}")
+        if os.path.isfile(fp):
+            os.remove(fp)
+            deleted_files.append(fp)
+
+    # Remove snapshot files via DB records
+    for fp in db.list_snapshot_files(t.id):
+        if os.path.isfile(fp):
+            os.remove(fp)
+            deleted_files.append(fp)
+
+    # Remove snapshot directory if empty
+    if os.path.isdir(snapshots_dir):
+        try:
+            shutil.rmtree(snapshots_dir)
+            deleted_files.append(snapshots_dir)
+        except OSError:
+            pass
+
+    db.delete_task(t.id)
+    if deleted_files:
+        st.success(f"已删除任务 {t.id}（{len(deleted_files)} 个文件）")
+
+
 st.divider()
 st.subheader("历史任务")
 tasks = db.list_tasks()
 if tasks:
+    _DEL_CONFIRM_KEY = "task_delete_confirm"
+    if _DEL_CONFIRM_KEY not in st.session_state:
+        st.session_state[_DEL_CONFIRM_KEY] = None
+
     for t in tasks:
         icon = {"done": "✅", "running": "⏳", "error": "❌", "pending": "🕐"}.get(t.status, "?")
-        st.write(f"{icon} **{t.id}** — {t.filename} — cells:{t.cell_count:,} inds:{t.indicator_count:,} ({t.created_at[:19]})")
+        c_info, c_del = st.columns([6, 1])
+        c_info.write(f"{icon} **{t.id}** — {t.filename} — cells:{t.cell_count:,} inds:{t.indicator_count:,} ({t.created_at[:19]})")
+        if c_del.button("🗑️", key=f"del_{t.id}", help=f"删除任务 {t.id}"):
+            st.session_state[_DEL_CONFIRM_KEY] = t.id
+
+        if st.session_state[_DEL_CONFIRM_KEY] == t.id:
+            st.warning(f"确认删除任务 **{t.id}**（{t.filename}）？输出文件将一并删除。")
+            cc1, cc2, _ = st.columns([1, 1, 6])
+            if cc1.button("确认删除", key=f"confirm_del_{t.id}", type="primary"):
+                _do_delete_task(db, t)
+                st.session_state[_DEL_CONFIRM_KEY] = None
+                st.rerun()
+            if cc2.button("取消", key=f"cancel_del_{t.id}"):
+                st.session_state[_DEL_CONFIRM_KEY] = None
+                st.rerun()
 else:
     st.info("暂无历史任务")
 

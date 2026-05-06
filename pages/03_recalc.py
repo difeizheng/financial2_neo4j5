@@ -13,7 +13,6 @@ from financial_kg.storage.task_db import TaskDB
 from financial_kg.engine.recalculator import recalculate
 from financial_kg.engine.snapshot import create_snapshot
 
-st.set_page_config(page_title="参数重算", layout="wide")
 st.title("⚙️ 参数修改 & 增量重算")
 
 db = TaskDB()

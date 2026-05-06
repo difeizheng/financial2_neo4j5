@@ -1,5 +1,5 @@
 from __future__ import annotations
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from typing import Any, Optional
 
 
@@ -52,5 +52,7 @@ class Indicator:
 
     @classmethod
     def from_dict(cls, d: dict) -> "Indicator":
-        d = {**d, "display_value": d.get("display_value")}
+        valid = {f.name for f in fields(cls)}
+        d = {k: v for k, v in d.items() if k in valid}
+        d.setdefault("display_value", None)
         return cls(**d)
