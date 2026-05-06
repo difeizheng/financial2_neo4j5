@@ -21,10 +21,12 @@ from financial_kg.viz.echarts_graph import (
     build_indicator_cell_graph_data,
     build_indicator_subgraph_data,
     build_table_graph_data,
+    build_indicator_graph_data,
 )
 from financial_kg.viz.echarts_template import render_graph_html
 import json
 
+st.set_page_config(layout="wide")
 st.title("🔍 图谱浏览")
 
 # ── Task selector ─────────────────────────────────────────────────────────────
@@ -68,78 +70,11 @@ if _NAV_KEY not in st.session_state:
 
 nav = st.session_state[_NAV_KEY]
 
-# ── Sidebar navigation ────────────────────────────────────────────────────────
-st.sidebar.header("层级导航")
-max_nodes = st.sidebar.slider("最大节点数", 50, 2000, 500, 50)
-
-sheets = sorted(stats["sheets"])
-sheet_opts = ["(选择 Sheet)"] + sheets
-sheet_idx = (sheets.index(nav["sheet"]) + 1) if nav["sheet"] in sheets else 0
-new_sheet_raw = st.sidebar.selectbox("Sheet", sheet_opts, index=sheet_idx)
-new_sheet = None if new_sheet_raw == "(选择 Sheet)" else new_sheet_raw
-if new_sheet != nav["sheet"]:
-    nav.update({"sheet": new_sheet, "table": None, "indicator": None, "cell": None})
-    st.rerun()
-
-if nav["sheet"]:
-    tables_in_sheet = [t for t in graph.tables.values() if t.sheet == nav["sheet"]]
-    tbl_ids = [t.id for t in tables_in_sheet]
-    tbl_names = [t.name[:30] for t in tables_in_sheet]
-    tbl_opts = ["(选择 Table)"] + tbl_names
-    tbl_idx = (tbl_ids.index(nav["table"]) + 1) if nav["table"] in tbl_ids else 0
-    new_tbl_name = st.sidebar.selectbox("Table", tbl_opts, index=tbl_idx)
-    new_tbl = None
-    if new_tbl_name != "(选择 Table)":
-        matched = [t for t in tables_in_sheet if t.name[:30] == new_tbl_name]
-        new_tbl = matched[0].id if matched else None
-    if new_tbl != nav["table"]:
-        nav.update({"table": new_tbl, "indicator": None, "cell": None})
-        st.rerun()
-
-if nav["table"]:
-    tbl_obj = graph.tables.get(nav["table"])
-    inds_in_table = [graph.indicators[i] for i in (tbl_obj.indicator_ids if tbl_obj else []) if i in graph.indicators]
-    ind_ids = [i.id for i in inds_in_table]
-    ind_names = [i.name[:30] for i in inds_in_table]
-    ind_opts = ["(选择 Indicator)"] + ind_names
-    ind_idx = (ind_ids.index(nav["indicator"]) + 1) if nav["indicator"] in ind_ids else 0
-    new_ind_name = st.sidebar.selectbox("Indicator", ind_opts, index=ind_idx)
-    new_ind = None
-    if new_ind_name != "(选择 Indicator)":
-        matched = [i for i in inds_in_table if i.name[:30] == new_ind_name]
-        new_ind = matched[0].id if matched else None
-    if new_ind != nav["indicator"]:
-        nav.update({"indicator": new_ind, "cell": None})
-        st.rerun()
-
-if nav["indicator"]:
-    ind_obj = graph.indicators.get(nav["indicator"])
-    cells_in_ind = [graph.cells[c] for c in (ind_obj.cell_ids if ind_obj else []) if c in graph.cells]
-    cell_ids = [c.id for c in cells_in_ind]
-    cell_opts = ["(选择 Cell)"] + cell_ids
-    cell_idx = (cell_ids.index(nav["cell"]) + 1) if nav["cell"] in cell_ids else 0
-    new_cell = st.sidebar.selectbox("Cell", cell_opts, index=cell_idx)
-    if new_cell == "(选择 Cell)":
-        new_cell = None
-    if new_cell != nav["cell"]:
-        nav["cell"] = new_cell
-        st.rerun()
-
-# ── Main area ─────────────────────────────────────────────────────────────────
-
 # ── Render engine toggle ──────────────────────────────────────────────────────
 _ENGINE_KEY = f"viz_engine_{task.id}"
 if _ENGINE_KEY not in st.session_state:
-    st.session_state[_ENGINE_KEY] = "pyvis"
+    st.session_state[_ENGINE_KEY] = "echarts"
 
-st.sidebar.header("渲染引擎")
-st.session_state[_ENGINE_KEY] = st.sidebar.radio(
-    "选择渲染引擎",
-    ["pyvis", "echarts"],
-    format_func=lambda x: "Pyvis (vis.js)" if x == "pyvis" else "ECharts (可切换布局)",
-    index=0 if st.session_state[_ENGINE_KEY] == "pyvis" else 1,
-    label_visibility="collapsed",
-)
 
 def _render_html(path: str, height: int = 640) -> None:
     with open(path, encoding="utf-8") as f:
@@ -147,7 +82,7 @@ def _render_html(path: str, height: int = 640) -> None:
 
 
 def _render_echarts(data: dict, height: int = 640, layout: str = "force") -> None:
-    html = render_graph_html(json.dumps(data, ensure_ascii=False, default=str), height=f"{height}px")
+    html = render_graph_html(json.dumps(data, ensure_ascii=False, default=str), height=f"{height}px", default_layout=layout)
     components.html(html, height=height, scrolling=False)
 
 
@@ -159,6 +94,156 @@ def _render_graph(pyvis_builder, data_builder, *args, height: int = 640, layout:
         _render_echarts(data_builder(*args, **kwargs), height=height, layout=layout)
 
 
+def _clear_below(level: str):
+    """Clear navigation below the given level."""
+    if level == "sheet":
+        nav.update({"table": None, "indicator": None, "cell": None})
+    elif level == "table":
+        nav.update({"indicator": None, "cell": None})
+    elif level == "indicator":
+        nav["cell"] = None
+
+
+def _navigate_to(level: str, value):
+    """Navigate to a specific level and rerun."""
+    if level == "sheet":
+        nav.update({"sheet": value, "table": None, "indicator": None, "cell": None})
+    elif level == "table":
+        nav.update({"table": value, "indicator": None, "cell": None})
+    elif level == "indicator":
+        nav.update({"indicator": value, "cell": None})
+    elif level == "cell":
+        nav["cell"] = value
+    st.rerun()
+
+
+# ── Sidebar ───────────────────────────────────────────────────────────────────
+st.sidebar.header("渲染引擎")
+st.session_state[_ENGINE_KEY] = st.sidebar.radio(
+    "选择渲染引擎",
+    ["pyvis", "echarts"],
+    format_func=lambda x: "Pyvis (vis.js)" if x == "pyvis" else "ECharts (可切换布局)",
+    index=0 if st.session_state[_ENGINE_KEY] == "pyvis" else 1,
+    label_visibility="collapsed",
+)
+
+st.sidebar.header("层级导航")
+max_nodes = st.sidebar.slider("最大节点数", 50, 2000, 500, 50)
+
+# Search box
+st.sidebar.header("搜索")
+search_query = st.sidebar.text_input("搜索指标名 / Cell ID / 表名", placeholder="输入关键词...")
+
+if search_query:
+    q = search_query.lower()
+    # Search indicators
+    matched_inds = [ind for ind in graph.indicators.values() if q in ind.name.lower() or q in ind.id.lower()]
+    # Search tables
+    matched_tbls = [tbl for tbl in graph.tables.values() if q in tbl.name.lower() or q in tbl.id.lower()]
+    # Search cells
+    matched_cells = [c for c in graph.cells.values() if q in c.id.lower()]
+
+    if matched_inds:
+        st.sidebar.caption(f"指标 ({len(matched_inds)})")
+        for ind in matched_inds[:20]:
+            label = f"{ind.name} ({ind.sheet})"
+            if st.sidebar.button(label, key=f"search_ind_{ind.id}", use_container_width=True):
+                _navigate_to("indicator", ind.id)
+        if len(matched_inds) > 20:
+            st.sidebar.caption(f"... 及其他 {len(matched_inds) - 20} 个")
+
+    if matched_tbls:
+        st.sidebar.caption(f"表 ({len(matched_tbls)})")
+        for tbl in matched_tbls[:20]:
+            label = f"{tbl.name} ({tbl.sheet})"
+            if st.sidebar.button(label, key=f"search_tbl_{tbl.id}", use_container_width=True):
+                _navigate_to("table", tbl.id)
+        if len(matched_tbls) > 20:
+            st.sidebar.caption(f"... 及其他 {len(matched_tbls) - 20} 个")
+
+    if matched_cells:
+        st.sidebar.caption(f"Cell ({len(matched_cells)})")
+        for c in matched_cells[:20]:
+            short_id = c.id.split("_", 1)[-1] if "_" in c.id else c.id
+            if st.sidebar.button(short_id, key=f"search_cell_{c.id}", use_container_width=True):
+                _navigate_to("cell", c.id)
+        if len(matched_cells) > 20:
+            st.sidebar.caption(f"... 及其他 {len(matched_cells) - 20} 个")
+
+    if not matched_inds and not matched_tbls and not matched_cells:
+        st.sidebar.info("无匹配结果")
+
+# Sheet selector
+sheets = sorted(stats["sheets"])
+sheet_opts = ["(选择 Sheet)"] + sheets
+sheet_idx = (sheets.index(nav["sheet"]) + 1) if nav["sheet"] in sheets else 0
+new_sheet_raw = st.sidebar.selectbox("Sheet", sheet_opts, index=sheet_idx)
+new_sheet = None if new_sheet_raw == "(选择 Sheet)" else new_sheet_raw
+if new_sheet != nav["sheet"]:
+    _navigate_to("sheet", new_sheet)
+
+if nav["sheet"]:
+    tables_in_sheet = [t for t in graph.tables.values() if t.sheet == nav["sheet"]]
+    tbl_names_map = {t.name[:30]: t.id for t in tables_in_sheet}
+    tbl_opts = ["(选择 Table)"] + list(tbl_names_map.keys())
+    tbl_idx = (list(tbl_names_map.values()).index(nav["table"]) + 1) if nav["table"] in tbl_names_map.values() else 0
+    new_tbl_name = st.sidebar.selectbox("Table", tbl_opts, index=tbl_idx)
+    new_tbl = tbl_names_map.get(new_tbl_name) if new_tbl_name != "(选择 Table)" else None
+    if new_tbl != nav["table"]:
+        _navigate_to("table", new_tbl)
+
+if nav["table"]:
+    tbl_obj = graph.tables.get(nav["table"])
+    inds_in_table = [graph.indicators[i] for i in (tbl_obj.indicator_ids if tbl_obj else []) if i in graph.indicators]
+    ind_names_map = {i.name[:30]: i.id for i in inds_in_table}
+    ind_opts = ["(选择 Indicator)"] + list(ind_names_map.keys())
+    ind_idx = (list(ind_names_map.values()).index(nav["indicator"]) + 1) if nav["indicator"] in ind_names_map.values() else 0
+    new_ind_name = st.sidebar.selectbox("Indicator", ind_opts, index=ind_idx)
+    new_ind = ind_names_map.get(new_ind_name) if new_ind_name != "(选择 Indicator)" else None
+    if new_ind != nav["indicator"]:
+        _navigate_to("indicator", new_ind)
+
+if nav["indicator"]:
+    ind_obj = graph.indicators.get(nav["indicator"])
+    cells_in_ind = [graph.cells[c] for c in (ind_obj.cell_ids if ind_obj else []) if c in graph.cells]
+    cell_ids = [c.id for c in cells_in_ind]
+    cell_opts = ["(选择 Cell)"] + cell_ids
+    cell_idx = (cell_ids.index(nav["cell"]) + 1) if nav["cell"] in cell_ids else 0
+    new_cell = st.sidebar.selectbox("Cell", cell_opts, index=cell_idx)
+    if new_cell == "(选择 Cell)":
+        new_cell = None
+    if new_cell != nav["cell"]:
+        _navigate_to("cell", new_cell)
+
+# ── Main area ─────────────────────────────────────────────────────────────────
+
+# Breadcrumb
+st.subheader("导航路径")
+bc_cols = st.columns(4)
+levels = [
+    ("Sheet", nav["sheet"]),
+    ("Table", nav["table"]),
+    ("Indicator", nav["indicator"]),
+    ("Cell", nav["cell"]),
+]
+for i, (level_name, level_val) in enumerate(levels):
+    with bc_cols[i]:
+        display = level_val if level_val else f"未选择 {level_name}"
+        if level_val:
+            if st.button(display, key=f"bc_{level_name.lower()}", use_container_width=True):
+                if i == 0:
+                    _navigate_to("sheet", None)
+                elif i == 1:
+                    _navigate_to("table", None)
+                elif i == 2:
+                    _navigate_to("indicator", None)
+                elif i == 3:
+                    _navigate_to("cell", None)
+        else:
+            st.caption(display)
+
+st.divider()
+
 # Cell level
 if nav["cell"]:
     cell = graph.cells[nav["cell"]]
@@ -169,13 +254,12 @@ if nav["cell"]:
     c3.metric("下游被依赖", len(cell.dependents))
     st.write(f"**公式**: `{cell.formula_raw or '无'}`")
     depth = st.slider("展开深度", 1, 5, 2)
-    if st.button("生成依赖子图"):
-        with st.spinner("渲染中..."):
-            _render_graph(
-                build_cell_subgraph, build_cell_subgraph_data,
-                graph, nav["cell"],
-                depth=depth,
-            )
+    _render_graph(
+        build_cell_subgraph, build_cell_subgraph_data,
+        graph, nav["cell"],
+        depth=depth,
+        layout="tree",
+    )
 
 # Indicator level
 elif nav["indicator"]:
@@ -208,12 +292,11 @@ elif nav["indicator"]:
         ]
         st.dataframe(rows, use_container_width=True)
 
-    if st.button("生成 Cell 关系图"):
-        with st.spinner("渲染中..."):
-            _render_graph(
-                build_indicator_cell_graph, build_indicator_cell_graph_data,
-                graph, nav["indicator"],
-            )
+    _render_graph(
+        build_indicator_cell_graph, build_indicator_cell_graph_data,
+        graph, nav["indicator"],
+        layout="mindmap",
+    )
 
 # Table level
 elif nav["table"]:
@@ -244,12 +327,11 @@ elif nav["table"]:
             })
         st.dataframe(rows, use_container_width=True)
 
-    if st.button("生成指标关系图"):
-        with st.spinner("渲染中..."):
-            _render_graph(
-                build_indicator_subgraph, build_indicator_subgraph_data,
-                graph, nav["table"],
-            )
+    _render_graph(
+        build_indicator_subgraph, build_indicator_subgraph_data,
+        graph, nav["table"],
+        layout="tree",
+    )
 
 # Sheet level
 elif nav["sheet"]:
@@ -285,55 +367,28 @@ elif nav["sheet"]:
     if orphan_cells > 0:
         st.caption(f"未归属 Cell（无 Indicator）: {orphan_cells} 个")
 
-    if st.button("生成表间关系图"):
-        with st.spinner("渲染中..."):
-            _render_graph(
-                build_table_graph, build_table_graph_data,
-                graph, nav["sheet"],
-            )
+    _render_graph(
+        build_table_graph, build_table_graph_data,
+        graph, nav["sheet"],
+        layout="mindmap",
+    )
 
-# Overview (no selection)
+# Overview (no selection) — full graph visualization
 else:
-    st.subheader("全量 Indicator 列表")
-    rows = []
-    for ind in list(graph.indicators.values())[:5000]:
-        val_str = ind.display_value if ind.display_value is not None else (
-            f"{ind.summary_value:.2f}" if isinstance(ind.summary_value, float)
-            else str(ind.summary_value or "")
-        )
-        rows.append({
-            "ID": ind.id,
-            "名称": ind.name,
-            "分类": ind.category or "",
-            "单位": ind.unit or "",
-            "汇总值": val_str,
-            "Sheet": ind.sheet,
-            "时间序列点数": len(ind.time_series),
-        })
-    if rows:
-        st.dataframe(rows, use_container_width=True)
-    else:
-        st.info("该任务暂无 Indicator 数据。")
+    st.subheader("全量图谱概览")
+    st.caption("力导向布局，4 秒后自动冻结。拖拽可微调节点位置。")
+    _render_echarts(
+        build_indicator_graph_data(graph, max_nodes=max_nodes),
+        height=800,
+        layout="force",
+    )
 
-    # Orphan cells summary
-    unlinked = graph.get_unlinked_cells()
-    total_unlinked = graph.unlinked_cell_count()
-    if total_unlinked > 0:
-        st.divider()
-        st.subheader(f"未关联 Table 的 Cell（共 {total_unlinked:,} 个）")
-        orphan_rows = []
-        for sheet, cell_ids in sorted(unlinked.items(), key=lambda x: -len(x[1])):
-            orphan_rows.append({
-                "Sheet": sheet,
-                "数量": len(cell_ids),
-                "占该 Sheet Cell 比例": f"{len(cell_ids) / sum(1 for c in graph.cells.values() if c.sheet == sheet) * 100:.1f}%",
-            })
-        st.dataframe(orphan_rows, use_container_width=True)
-
-        if st.checkbox("展开查看孤儿 Cell ID"):
-            for sheet, cell_ids in sorted(unlinked.items(), key=lambda x: -len(x[1])):
-                st.caption(f"**{sheet}** ({len(cell_ids)} 个)")
-                st.text(", ".join(cell_ids[:200]))
-                if len(cell_ids) > 200:
-                    st.caption(f"... 及其他 {len(cell_ids) - 200} 个")
-
+    # Quick stats
+    st.divider()
+    st.subheader("按 Sheet 统计")
+    sheet_rows = []
+    for sheet_name in sorted(stats["sheets"]):
+        tbl_count = sum(1 for t in graph.tables.values() if t.sheet == sheet_name)
+        ind_count = sum(1 for i in graph.indicators.values() if i.sheet == sheet_name)
+        sheet_rows.append({"Sheet": sheet_name, "Table": tbl_count, "Indicator": ind_count})
+    st.dataframe(sheet_rows, use_container_width=True)
