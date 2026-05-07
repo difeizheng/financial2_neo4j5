@@ -95,12 +95,22 @@ def diff_snapshots(
         new_val = snap_b.values.get(cell_id)
         if not _values_equal(old_val, new_val):
             cell = graph.cells.get(cell_id)
+            magnitude = _compute_magnitude(old_val, new_val)
+            direction = _compute_direction(old_val, new_val)
+            indicator_name = ""
+            if cell and cell.indicator_id:
+                ind = graph.indicators.get(cell.indicator_id)
+                if ind:
+                    indicator_name = ind.name
             changed_cells.append({
                 "id": cell_id,
                 "sheet": cell.sheet if cell else "",
                 "old": old_val,
                 "new": new_val,
                 "formula": cell.formula_raw if cell else None,
+                "change_magnitude": magnitude,
+                "direction": direction,
+                "indicator_name": indicator_name,
             })
             if cell:
                 sheets_affected.add(cell.sheet)
@@ -166,6 +176,29 @@ def _serialize_value(val: Any) -> Any:
     if isinstance(val, (int, float)):
         return val
     return str(val)
+
+
+def _compute_magnitude(old_val: Any, new_val: Any) -> float:
+    """变化幅度: 数值取绝对差, 字符串/None 取 0。"""
+    if old_val is None or new_val is None:
+        try:
+            return abs(float(new_val if new_val is not None else old_val))
+        except (TypeError, ValueError):
+            return 0.0
+    try:
+        return abs(float(new_val) - float(old_val))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _compute_direction(old_val: Any, new_val: Any) -> str:
+    """变化方向: increase / decrease。"""
+    if old_val is None or new_val is None:
+        return "increase"
+    try:
+        return "increase" if float(new_val) >= float(old_val) else "decrease"
+    except (TypeError, ValueError):
+        return "unchanged"
 
 
 def _values_equal(old_val: Any, new_val: Any) -> bool:

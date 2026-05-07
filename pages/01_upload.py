@@ -455,6 +455,13 @@ if wiz["step"] == 2:
         paths = save_graph(graph, output_dir, task_id=task_id)
         timer.stop()
         wiz["paths"] = paths
+        progress_bar.progress(90, text="保存原始 Excel 副本...")
+
+        # Save original Excel copy for later export
+        original_copy = os.path.join(output_dir, f"{task_id}_original.xlsx")
+        import shutil
+        shutil.copy2(tmp_path, original_copy)
+
         progress_bar.progress(100, text="保存完成")
         _render_stage_timings(timing_container, timer.summary())
 
