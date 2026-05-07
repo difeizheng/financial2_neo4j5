@@ -366,6 +366,8 @@ def render_graph_html(
         <option value="radial"{" selected" if default_layout == "radial" else ""}>径向</option>
         <option value="tree"{" selected" if default_layout == "tree" else ""}>分层树</option>
         <option value="mindmap"{" selected" if default_layout == "mindmap" else ""}>思维导图</option>
+        <option value="layered"{" selected" if default_layout == "layered" else ""}>分层层次</option>
+        <option value="concentric"{" selected" if default_layout == "concentric" else ""}>同心圆</option>
       </select>
     </div>
   </div>
@@ -666,6 +668,276 @@ function computeMindmapPositions() {
   return positions;
 }
 
+function computeLayeredPositions() {
+  var positions = {};
+  if (allNodes.length === 0) return positions;
+
+  // Build adjacency for depth computation (longest path from sources)
+  var inDeg = {};
+  var children = {};
+  var nodeIds = {};
+  allNodes.forEach(function(n) {
+    inDeg[n.id] = 0;
+    children[n.id] = [];
+    nodeIds[n.id] = true;
+  });
+  allEdges.forEach(function(e) {
+    if (nodeIds[e.source] && nodeIds[e.target]) {
+      children[e.source].push(e.target);
+      inDeg[e.target]++;
+    }
+  });
+
+  // Topological order (Kahn's) + longest path depth
+  var depth = {};
+  var queue = [];
+  for (var id in inDeg) {
+    if (inDeg[id] === 0) { depth[id] = 0; queue.push(id); }
+  }
+  var qi = 0;
+  while (qi < queue.length) {
+    var u = queue[qi++];
+    for (var ci = 0; ci < (children[u] || []).length; ci++) {
+      var v = children[u][ci];
+      depth[v] = Math.max(depth[v] || 0, (depth[u] || 0) + 1);
+      inDeg[v]--;
+      if (inDeg[v] === 0) queue.push(v);
+    }
+  }
+  // Handle cycles (unvisited nodes) — assign max depth + 1
+  var maxD = 0;
+  for (var id in depth) { if (depth[id] > maxD) maxD = depth[id]; }
+  allNodes.forEach(function(n) {
+    if (depth[n.id] === undefined) depth[n.id] = maxD + 1;
+  });
+
+  // Group by depth
+  var layers = {};
+  var maxDepth = 0;
+  for (var id in depth) {
+    var d = depth[id];
+    if (!layers[d]) layers[d] = [];
+    layers[d].push(id);
+    if (d > maxDepth) maxDepth = d;
+  }
+
+  // Barycenter heuristic: reorder within each layer to reduce edge crossings
+  // Iterate 3 passes: alternate sweep up/down
+  function barycenterOrder(layerIds, prevLayerIds, edgeDir) {
+    // edgeDir: 'forward' (edges go from prev to this layer) or 'backward'
+    var posMap = {};
+    for (var i = 0; i < prevLayerIds.length; i++) posMap[prevLayerIds[i]] = i;
+    return layerIds.slice().sort(function(a, b) {
+      var aSum = 0, aCnt = 0, bSum = 0, bCnt = 0;
+      var nbrs = edgeDir === 'forward'
+        ? children[a] : [];
+      // For each neighbor in prev layer, get its position
+      for (var ni = 0; ni < nbrs.length; ni++) {
+        if (posMap[nbrs[ni]] !== undefined) { aSum += posMap[nbrs[ni]]; aCnt++; }
+      }
+      var nbrs2 = edgeDir === 'forward'
+        ? children[b] : [];
+      for (var ni = 0; ni < nbrs2.length; ni++) {
+        if (posMap[nbrs2[ni]] !== undefined) { bSum += posMap[nbrs2[ni]]; bCnt++; }
+      }
+      var aAvg = aCnt > 0 ? aSum / aCnt : aSum;
+      var bAvg = bCnt > 0 ? bSum / bCnt : bSum;
+      return aAvg - bAvg;
+    });
+  }
+
+  // Build reverse children map for barycenter
+  var parents = {};
+  for (var id in nodeIds) parents[id] = [];
+  allEdges.forEach(function(e) {
+    if (nodeIds[e.source] && nodeIds[e.target]) parents[e.target].push(e.source);
+  });
+
+  for (var pass = 0; pass < 3; pass++) {
+    for (var d = 1; d <= maxDepth; d++) {
+      var layer = layers[d];
+      if (!layer) continue;
+      var prevLayer = layers[d - 1];
+      if (!prevLayer) continue;
+      // Compute barycenter based on connections to previous layer
+      var prevPos = {};
+      for (var i = 0; i < prevLayer.length; i++) prevPos[prevLayer[i]] = i;
+      layer.sort(function(a, b) {
+        var aSum = 0, aCnt = 0, bSum = 0, bCnt = 0;
+        var pa = parents[a] || [];
+        for (var pi = 0; pi < pa.length; pi++) {
+          if (prevPos[pa[pi]] !== undefined) { aSum += prevPos[pa[pi]]; aCnt++; }
+        }
+        var pb = parents[b] || [];
+        for (var pi = 0; pi < pb.length; pi++) {
+          if (prevPos[pb[pi]] !== undefined) { bSum += prevPos[pb[pi]]; bCnt++; }
+        }
+        var aAvg = aCnt > 0 ? aSum / aCnt : 999999;
+        var bAvg = bCnt > 0 ? bSum / bCnt : 999999;
+        return aAvg - bAvg;
+      });
+    }
+  }
+
+  // Assign positions: x = depth * colWidth, y = index in layer * adaptive rowHeight
+  var colW = 300;
+  var maxLayerSize = 0;
+  for (var d = 0; d <= maxDepth; d++) {
+    if (layers[d] && layers[d].length > maxLayerSize) maxLayerSize = layers[d].length;
+  }
+
+  // Adaptive rowHeight: leave room for small nodes (4-8px) in each layer
+  // Target: fit within typical viewport, nodes ~6px apart minimum
+  var targetMaxH = Math.min(allNodes.length * 8, 3000); // cap total height
+  var rowH = maxLayerSize > 1 ? Math.max(10, targetMaxH / maxLayerSize) : 60;
+
+  for (var d = 0; d <= maxDepth; d++) {
+    var layer = layers[d] || [];
+    var totalH = (layer.length - 1) * rowH;
+    var startY = -totalH / 2;
+    for (var i = 0; i < layer.length; i++) {
+      positions[layer[i]] = {x: d * colW, y: startY + i * rowH};
+    }
+  }
+
+  // Unvisited nodes at bottom-right
+  var unplaced = [];
+  allNodes.forEach(function(n) {
+    if (!positions[n.id]) unplaced.push(n);
+  });
+  var maxY = 0;
+  for (var id in positions) { if (positions[id].y > maxY) maxY = positions[id].y; }
+  for (var i = 0; i < unplaced.length; i++) {
+    positions[unplaced[i].id] = {x: (maxDepth + 1) * colW, y: maxY + (i + 1) * Math.max(rowH, 10)};
+  }
+
+  // Center X
+  var totalW = maxDepth * colW;
+  var offsetX = -totalW / 2;
+  for (var id in positions) { positions[id].x += offsetX; }
+
+  return positions;
+}
+
+function computeConcentricPositions() {
+  var positions = {};
+  if (allNodes.length === 0) return positions;
+
+  // Find root: use rootId, or node with no incoming edges, or first node
+  var rootNode = null;
+  if (rootId) {
+    for (var i = 0; i < allNodes.length; i++) {
+      if (allNodes[i].id === rootId) { rootNode = allNodes[i]; break; }
+    }
+  }
+  if (!rootNode) {
+    var hasInc = {};
+    allEdges.forEach(function(e) { hasInc[e.target] = true; });
+    for (var i = 0; i < allNodes.length; i++) {
+      if (!hasInc[allNodes[i].id]) { rootNode = allNodes[i]; break; }
+    }
+  }
+  if (!rootNode) rootNode = allNodes[0];
+
+  // BFS: compute depth from root
+  var depth = {};
+  var children = {};
+  var visited = {};
+  depth[rootNode.id] = 0;
+  children[rootNode.id] = [];
+  var queue = [rootNode.id];
+  var qi = 0;
+  while (qi < queue.length) {
+    var nid = queue[qi++];
+    if (visited[nid]) continue;
+    visited[nid] = true;
+    if (!children[nid]) children[nid] = [];
+    allEdges.forEach(function(e) {
+      if (e.source === nid && !visited[e.target]) {
+        depth[e.target] = (depth[nid] || 0) + 1;
+        children[nid].push(e.target);
+        if (!children[e.target]) children[e.target] = [];
+        queue.push(e.target);
+      }
+    });
+  }
+
+  // Unvisited nodes: assign to max depth + 1
+  var maxD = 0;
+  for (var id in depth) { if (depth[id] > maxD) maxD = depth[id]; }
+  allNodes.forEach(function(n) {
+    if (depth[n.id] === undefined) {
+      depth[n.id] = maxD + 1;
+      children[n.id] = [];
+    }
+  });
+
+  // Group by depth
+  var layers = {};
+  var maxDepth = 0;
+  for (var id in depth) {
+    var d = depth[id];
+    if (!layers[d]) layers[d] = [];
+    layers[d].push(id);
+    if (d > maxDepth) maxDepth = d;
+  }
+
+  // Barycenter reorder within layers (same as layered)
+  var parents = {};
+  for (var id in depth) parents[id] = [];
+  allEdges.forEach(function(e) {
+    if (depth[e.source] !== undefined && depth[e.target] !== undefined) {
+      parents[e.target].push(e.source);
+    }
+  });
+
+  for (var pass = 0; pass < 3; pass++) {
+    for (var d = 1; d <= maxDepth; d++) {
+      var layer = layers[d];
+      if (!layer) continue;
+      var prevLayer = layers[d - 1];
+      if (!prevLayer) continue;
+      var prevPos = {};
+      for (var i = 0; i < prevLayer.length; i++) prevPos[prevLayer[i]] = i;
+      layer.sort(function(a, b) {
+        var aSum = 0, aCnt = 0, bSum = 0, bCnt = 0;
+        var pa = parents[a] || [];
+        for (var pi = 0; pi < pa.length; pi++) {
+          if (prevPos[pa[pi]] !== undefined) { aSum += prevPos[pa[pi]]; aCnt++; }
+        }
+        var pb = parents[b] || [];
+        for (var pi = 0; pi < pb.length; pi++) {
+          if (prevPos[pb[pi]] !== undefined) { bSum += prevPos[pb[pi]]; bCnt++; }
+        }
+        var aAvg = aCnt > 0 ? aSum / aCnt : 999999;
+        var bAvg = bCnt > 0 ? bSum / bCnt : 999999;
+        return aAvg - bAvg;
+      });
+    }
+  }
+
+  // Place on concentric rings
+  var ringStep = 150;
+  var angleStepBase = 0.3;
+  for (var d = 0; d <= maxDepth; d++) {
+    var layer = layers[d] || [];
+    if (d === 0) {
+      positions[layer[0]] = {x: 0, y: 0};
+      continue;
+    }
+    var count = layer.length;
+    var r = d * ringStep;
+    var angleStep = count > 1 ? (2 * Math.PI / count) : 0;
+    var startAngle = -Math.PI / 2;
+    for (var i = 0; i < count; i++) {
+      var angle = startAngle + i * angleStep;
+      positions[layer[i]] = {x: r * Math.cos(angle), y: r * Math.sin(angle)};
+    }
+  }
+
+  return positions;
+}
+
 function applyPositions(nodes, positions) {
   return nodes.map(function(n) {
     var p = positions[n.id];
@@ -708,7 +980,7 @@ function getOption(nodes, edges) {
     },
     series: [{
       type: 'graph',
-      layout: (currentLayout === 'radial' || currentLayout === 'tree' || currentLayout === 'mindmap') ? 'none' : currentLayout,
+      layout: (currentLayout === 'radial' || currentLayout === 'tree' || currentLayout === 'mindmap' || currentLayout === 'layered' || currentLayout === 'concentric') ? 'none' : currentLayout,
       data: nodes,
       links: edges,
       categories: categories,
@@ -720,13 +992,13 @@ function getOption(nodes, edges) {
       animationDurationUpdate: 300,
       animationEasingUpdate: 'cubicInOut',
       label: {
-        show: currentLayout === 'tree' || currentLayout === 'mindmap' || currentLayout === 'radial',
+        show: currentLayout === 'tree' || currentLayout === 'mindmap',
         position: currentLayout === 'tree' ? 'bottom' : 'right',
         fontSize: 9,
         color: '#cdd6f4',
       },
       lineStyle: {
-        curveness: (currentLayout === 'tree' || currentLayout === 'mindmap') ? 0.2 : 0,
+        curveness: (currentLayout === 'tree' || currentLayout === 'mindmap' || currentLayout === 'concentric') ? 0.2 : 0,
       },
     }],
   };
@@ -744,6 +1016,27 @@ function getOption(nodes, edges) {
     s.circular = {
       rotateLabel: true,
     };
+  } else if (currentLayout === 'layered') {
+    // Dense DAG: shrink nodes, thin edges, label on hover only, zoom range wider
+    var maxSym = 0, minSym = Infinity;
+    for (var si = 0; si < nodes.length; si++) {
+      if (nodes[si].symbolSize > maxSym) maxSym = nodes[si].symbolSize;
+      if (nodes[si].symbolSize < minSym) minSym = nodes[si].symbolSize;
+    }
+    var sc = maxSym > 12 ? 0.35 : 1;
+    for (var si = 0; si < nodes.length; si++) {
+      nodes[si] = Object.assign({}, nodes[si], {symbolSize: Math.max(4, Math.round(nodes[si].symbolSize * sc))});
+    }
+    s.lineStyle = {width: 0.6, curveness: 0.15, opacity: 0.3};
+    s.emphasis = {focus: 'adjacency', lineStyle: {width: 2.5}};
+    s.label = {show: true, position: 'right', fontSize: 8, color: '#cdd6f4', offset: [4, 0]};
+    s.scaleLimit = {min: 0.1, max: 20};
+    s.zoom = 0.6;
+  } else if (currentLayout === 'concentric') {
+    s.lineStyle = {width: 1, curveness: 0.2, opacity: 0.6};
+    s.emphasis = {focus: 'adjacency', lineStyle: {width: 3}};
+    s.label = {show: true, position: 'right', fontSize: 8, color: '#cdd6f4'};
+    s.scaleLimit = {min: 0.2, max: 10};
   }
   // radial uses layout:'none' with pre-computed x/y
 
@@ -770,6 +1063,12 @@ if (currentLayout === 'radial') {
 } else if (currentLayout === 'mindmap') {
   var mindPos = computeMindmapPositions();
   initNodes = applyPositions(allNodes, mindPos);
+} else if (currentLayout === 'layered') {
+  var layeredPos = computeLayeredPositions();
+  initNodes = applyPositions(allNodes, layeredPos);
+} else if (currentLayout === 'concentric') {
+  var concentricPos = computeConcentricPositions();
+  initNodes = applyPositions(allNodes, concentricPos);
 }
 
 chart.setOption(getOption(buildNodesForLayout(initNodes), allEdges));
@@ -836,9 +1135,15 @@ document.getElementById('sel-layout').addEventListener('change', function() {
   } else if (currentLayout === 'mindmap') {
     var mindPos = computeMindmapPositions();
     newNodes = applyPositions(allNodes, mindPos);
+  } else if (currentLayout === 'layered') {
+    var layeredPos = computeLayeredPositions();
+    newNodes = applyPositions(allNodes, layeredPos);
+  } else if (currentLayout === 'concentric') {
+    var concentricPos = computeConcentricPositions();
+    newNodes = applyPositions(allNodes, concentricPos);
   }
   chart.setOption(getOption(
-    (currentLayout === 'radial' || currentLayout === 'tree' || currentLayout === 'mindmap') ? newNodes : buildNodesForLayout(allNodes),
+    (currentLayout === 'radial' || currentLayout === 'tree' || currentLayout === 'mindmap' || currentLayout === 'layered' || currentLayout === 'concentric') ? newNodes : buildNodesForLayout(allNodes),
     allEdges
   ), true);
 

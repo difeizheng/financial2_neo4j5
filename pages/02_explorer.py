@@ -258,7 +258,7 @@ if nav["cell"]:
         build_cell_subgraph, build_cell_subgraph_data,
         graph, nav["cell"],
         depth=depth,
-        layout="tree",
+        layout="layered",
     )
 
 # Indicator level
@@ -295,7 +295,7 @@ elif nav["indicator"]:
     _render_graph(
         build_indicator_cell_graph, build_indicator_cell_graph_data,
         graph, nav["indicator"],
-        layout="mindmap",
+        layout="concentric",
     )
 
 # Table level
@@ -330,7 +330,7 @@ elif nav["table"]:
     _render_graph(
         build_indicator_subgraph, build_indicator_subgraph_data,
         graph, nav["table"],
-        layout="tree",
+        layout="layered",
     )
 
 # Sheet level
@@ -370,7 +370,7 @@ elif nav["sheet"]:
     _render_graph(
         build_table_graph, build_table_graph_data,
         graph, nav["sheet"],
-        layout="mindmap",
+        layout="concentric",
     )
 
 # Overview (no selection) — full graph visualization
