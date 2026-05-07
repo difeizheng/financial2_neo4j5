@@ -81,7 +81,10 @@ class QAEngine:
 
         messages = [{"role": "system", "content": system_prompt}]
         for h in (chat_history or [])[:-1]:
-            messages.append(h)
+            msg = dict(h)
+            if isinstance(msg.get("content"), dict):
+                msg["content"] = msg["content"].get("text", "")
+            messages.append(msg)
         messages.append({"role": "user", "content": question})
 
         try:
@@ -169,7 +172,10 @@ class QAEngine:
 
         messages = [{"role": "system", "content": system_prompt}]
         for h in (chat_history or [])[:-1]:
-            messages.append(h)
+            msg = dict(h)
+            if isinstance(msg.get("content"), dict):
+                msg["content"] = msg["content"].get("text", "")
+            messages.append(msg)
         messages.append({"role": "user", "content": question})
 
         try:
@@ -177,6 +183,8 @@ class QAEngine:
                 model=self._model, messages=messages, max_tokens=1024, stream=True
             )
             for chunk in stream:
+                if not chunk.choices:
+                    continue
                 delta = chunk.choices[0].delta.content
                 if delta:
                     yield ("chunk", delta)

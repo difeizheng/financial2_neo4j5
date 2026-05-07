@@ -1,5 +1,6 @@
 """SQLite-backed task and snapshot registry."""
 from __future__ import annotations
+import json
 import sqlite3
 import os
 from contextlib import contextmanager
@@ -71,6 +72,15 @@ class TaskDB:
                     filepath TEXT NOT NULL,
                     FOREIGN KEY (task_id) REFERENCES tasks(id)
                 );
+                CREATE TABLE IF NOT EXISTS qa_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id TEXT NOT NULL,
+                    messages TEXT NOT NULL DEFAULT '[]',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY (task_id) REFERENCES tasks(id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_qa_history_task ON qa_history(task_id);
             """)
 
     # ── Tasks ────────────────────────────────────────────────────────────────
@@ -153,6 +163,41 @@ class TaskDB:
         with self._conn() as conn:
             row = conn.execute("SELECT * FROM snapshots WHERE id=?", (snap_id,)).fetchone()
         return _row_to_snapshot(row) if row else None
+
+    # ── QA History ────────────────────────────────────────────────────────────
+
+    def save_qa_history(self, task_id: str, messages: list[dict]) -> None:
+        now = datetime.now().isoformat()
+        with self._conn() as conn:
+            existing = conn.execute(
+                "SELECT id FROM qa_history WHERE task_id=?", (task_id,)
+            ).fetchone()
+            if existing:
+                conn.execute(
+                    "UPDATE qa_history SET messages=?, updated_at=? WHERE task_id=?",
+                    (json.dumps(messages, ensure_ascii=False), now, task_id),
+                )
+            else:
+                conn.execute(
+                    "INSERT INTO qa_history (task_id, messages, created_at, updated_at) VALUES (?,?,?,?)",
+                    (task_id, json.dumps(messages, ensure_ascii=False), now, now),
+                )
+
+    def load_qa_history(self, task_id: str) -> list[dict]:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT messages FROM qa_history WHERE task_id=?", (task_id,)
+            ).fetchone()
+        if row:
+            try:
+                return json.loads(row["messages"])
+            except (json.JSONDecodeError, TypeError):
+                return []
+        return []
+
+    def clear_qa_history(self, task_id: str) -> None:
+        with self._conn() as conn:
+            conn.execute("DELETE FROM qa_history WHERE task_id=?", (task_id,))
 
     # ── Delete ─────────────────────────────────────────────────────────────────
 
