@@ -238,6 +238,7 @@ def apply_and_recalc(
     graph: FinancialGraph,
     ws: WorkspaceState,
     base_graph: FinancialGraph,
+    record_history: bool = True,
 ) -> RecalcResult:
     """Apply scenario overrides + pending edits to graph and recalculate.
 
@@ -245,6 +246,7 @@ def apply_and_recalc(
         graph: The mutable graph to apply changes to (should be a deepcopy of base).
         ws: Current workspace state.
         base_graph: The original read-only graph (used to get original values for record-keeping).
+        record_history: If False, skip appending to history (used for rollbacks).
 
     Returns:
         RecalcResult from recalculate().
@@ -274,8 +276,9 @@ def apply_and_recalc(
             "error_count": len(result.error_cells),
         }
 
-    # Record modifications
-    record_modifications(ws, graph, updates, result, batch_id)
+    # Record modifications (skip for rollbacks — the record was already removed)
+    if record_history:
+        record_modifications(ws, graph, updates, result, batch_id)
 
     ws.last_recalc_result = {
         "affected_count": result.affected_count,

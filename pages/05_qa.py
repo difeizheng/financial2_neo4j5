@@ -420,7 +420,15 @@ if question:
     structured = _build_structured_answer(question, state)
     state["structured"] = structured
 
-    # Save to history (structured data + text)
+    # Save user question + structured answer to history
+    # Note: quick question / follow-up buttons already appended user message
+    # before rerun. Only chat_input direct entry reaches here without user msg.
+    # Also guard against chat_input rerun where user msg may already exist.
+    def _already_asked(q: str) -> bool:
+        return any(m.get("role") == "user" and m.get("content") == q for m in chat_history[-5:])
+
+    if not _already_asked(question):
+        chat_history.append({"role": "user", "content": question})
     chat_history.append({
         "role": "assistant",
         "content": structured,
