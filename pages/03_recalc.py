@@ -146,102 +146,122 @@ scenario = ws.scenarios.get(ws.active_scenario)
 with editor_col:
     st.subheader("📝 编辑参数")
 
-    # Filter bar
-    filter_a, filter_b, filter_c = st.columns([2, 1, 1])
+    # Global filters
+    filter_a, filter_b = st.columns([2, 1])
     with filter_a:
         search_kw = st.text_input("搜索", placeholder="Cell ID / Indicator / Table", label_visibility="collapsed", key="p_search")
     with filter_b:
         selected_sheets = st.multiselect("Sheet", all_sheets, default=[], label_visibility="collapsed", key="p_sheets")
-    with filter_c:
-        all_types = sorted(set(r["类型"] for r in all_param_cells if r["类型"]))
-        selected_types = st.multiselect("类型", all_types, default=["number"], label_visibility="collapsed", key="p_types")
 
-    # Build filtered list
-    filtered = []
+    # Group cells by type
+    type_map = {"number": "数值", "formula": "公式", "string": "文本", "date": "日期", "bool": "布尔", "empty": "空值"}
+
+    cells_by_type: dict[str, list] = {}
     for r in all_param_cells:
-        cid = r["Cell ID"]
+        t = r["类型"]
         if selected_sheets and r["Sheet"] not in selected_sheets:
-            continue
-        if selected_types and r["类型"] not in selected_types:
             continue
         if search_kw:
             kw = search_kw.lower()
-            if kw not in cid.lower() and kw not in r["Indicator 名称"].lower() and kw not in r["Table 名称"].lower():
+            if kw not in r["Cell ID"].lower() and kw not in r["Indicator 名称"].lower() and kw not in r["Table 名称"].lower():
                 continue
-        filtered.append(r)
+        cells_by_type.setdefault(t, []).append(r)
 
-    # Build dataframe
-    if filtered:
-        df = pd.DataFrame(filtered)
-        df["场景值"] = df["当前值"].copy()
+    # Sort: number first, then others
+    type_order = ["number", "formula", "string", "date", "bool", "empty"]
+    present_types = [t for t in type_order if t in cells_by_type]
+    for t in sorted(cells_by_type.keys()):
+        if t not in type_order:
+            present_types.append(t)
 
-        # Pre-fill scenario overrides
-        if scenario:
-            for idx in df.index:
-                cid = df.at[idx, "Cell ID"]
-                if cid in scenario.overrides:
-                    df.at[idx, "场景值"] = scenario.overrides[cid]
+    type_labels = [type_map.get(t, t) for t in present_types]
+    type_tabs = st.tabs([f"{type_labels[i]} ({len(cells_by_type[present_types[i]])})" for i in range(len(present_types))])
 
-        # Pre-fill pending edits
-        pending_key = f"pending_{ws.active_scenario}"
-        current_pending = st.session_state.get(pending_key, {})
-        for idx in df.index:
-            cid = df.at[idx, "Cell ID"]
-            if cid in current_pending:
-                df.at[idx, "场景值"] = current_pending[cid]
+    # Collect pending edits across all tabs
+    pending_key = f"pending_{ws.active_scenario}"
+    current_pending = st.session_state.get(pending_key, {})
+    new_pending: dict[str, Any] = {}
 
-        edited_df = st.data_editor(
-            df,
-            column_config={
-                "Cell ID": st.column_config.TextColumn("Cell ID", disabled=True, width="medium"),
-                "Indicator 名称": st.column_config.TextColumn("Indicator", disabled=True),
-                "Table 名称": st.column_config.TextColumn("Table", disabled=True),
-                "Sheet": st.column_config.TextColumn("Sheet", disabled=True, width="small"),
-                "类型": st.column_config.TextColumn("类型", disabled=True, width="small"),
-                "当前值": st.column_config.NumberColumn("当前值", disabled=True, width="small"),
-                "场景值": st.column_config.NumberColumn("场景值", width="small"),
-            },
-            use_container_width=True,
-            hide_index=True,
-            key=f"pedit_{ws.active_scenario}",
-        )
+    for tab_idx, dtype in enumerate(present_types):
+        with type_tabs[tab_idx]:
+            rows = cells_by_type[dtype]
+            if rows:
+                df = pd.DataFrame(rows)
+                df["场景值"] = df["当前值"].copy()
 
-        # Detect changes
-        new_pending: dict[str, Any] = {}
-        for _, row in edited_df.iterrows():
-            cid = row["Cell ID"]
-            new_val = row["场景值"]
-            old_val = row["当前值"]
-            try:
-                if abs(float(new_val) - float(old_val)) > 1e-9:
-                    new_pending[cid] = new_val
-            except (ValueError, TypeError):
-                if new_val != old_val:
-                    new_pending[cid] = new_val
+                # Pre-fill scenario overrides
+                if scenario:
+                    for idx in df.index:
+                        cid = df.at[idx, "Cell ID"]
+                        if cid in scenario.overrides:
+                            df.at[idx, "场景值"] = scenario.overrides[cid]
 
-        st.session_state[pending_key] = new_pending
-        ws.pending_edits = new_pending
+                # Pre-fill pending edits
+                for idx in df.index:
+                    cid = df.at[idx, "Cell ID"]
+                    if cid in current_pending:
+                        df.at[idx, "场景值"] = current_pending[cid]
 
-        # Status metrics
-        st.metric("已修改", len(new_pending))
+                col_cfg = {
+                    "Cell ID": st.column_config.TextColumn("Cell ID", disabled=True, width="medium"),
+                    "Indicator 名称": st.column_config.TextColumn("Indicator", disabled=True),
+                    "Table 名称": st.column_config.TextColumn("Table", disabled=True),
+                    "Sheet": st.column_config.TextColumn("Sheet", disabled=True, width="small"),
+                    "当前值": st.column_config.TextColumn("当前值", disabled=True, width="small"),
+                }
 
-        # Action buttons
-        act_a, act_b, act_c = st.columns([1, 1, 2])
-        with act_a:
-            if st.button("清空修改", use_container_width=True):
+                # Use number column for numeric types, text for others
+                if dtype in ("number",):
+                    col_cfg["场景值"] = st.column_config.NumberColumn("场景值", width="small")
+                    col_cfg["当前值"] = st.column_config.NumberColumn("当前值", disabled=True, width="small")
+                else:
+                    col_cfg["场景值"] = st.column_config.TextColumn("场景值", width="small")
+
+                edited_df = st.data_editor(
+                    df,
+                    column_config=col_cfg,
+                    use_container_width=True,
+                    hide_index=True,
+                    key=f"pedit_{ws.active_scenario}_{dtype}",
+                )
+
+                # Detect changes
+                for _, row in edited_df.iterrows():
+                    cid = row["Cell ID"]
+                    new_val = row["场景值"]
+                    old_val = row["当前值"]
+                    try:
+                        if abs(float(new_val) - float(old_val)) > 1e-9:
+                            new_pending[cid] = new_val
+                    except (ValueError, TypeError):
+                        if new_val != old_val:
+                            new_pending[cid] = new_val
+            else:
+                st.info("无此类型的参数单元格")
+
+    st.session_state[pending_key] = new_pending
+    ws.pending_edits = new_pending
+
+    # Status metrics
+    st.metric("已修改", len(new_pending))
+
+    # Action buttons
+    act_a, act_b, act_c = st.columns([1, 1, 2])
+    with act_a:
+        if st.button("清空修改", use_container_width=True):
+            st.session_state[pending_key] = {}
+            ws.pending_edits = {}
+            save_workspace(ws)
+            st.rerun()
+    with act_b:
+        if st.button("保存到场景", use_container_width=True):
+            if scenario and new_pending:
+                scenario.overrides.update(new_pending)
                 st.session_state[pending_key] = {}
                 ws.pending_edits = {}
                 save_workspace(ws)
+                st.toast(f"已保存 {len(new_pending)} 个修改到「{ws.active_scenario}」", icon="💾")
                 st.rerun()
-        with act_b:
-            if st.button("保存到场景", use_container_width=True):
-                if scenario and new_pending:
-                    scenario.overrides.update(new_pending)
-                    st.session_state[pending_key] = {}
-                    ws.pending_edits = {}
-                    save_workspace(ws)
-                    st.toast(f"已保存 {len(new_pending)} 个修改到「{ws.active_scenario}」", icon="💾")
-                    st.rerun()
         with act_c:
             apply_clicked = st.button("🔄 应用并重算", type="primary", use_container_width=True)
 
@@ -264,8 +284,6 @@ with editor_col:
                 st.session_state[f"auto_viz_{task.id}"] = True
                 st.toast(f"重算完成：{result.affected_count} 个变化，快照「{snap_name}」已保存", icon="✅")
                 st.rerun()
-    else:
-        st.info("无匹配参数，请调整筛选条件")
 
 # ── Right: Results panel ────────────────────────────────────────────────────
 
