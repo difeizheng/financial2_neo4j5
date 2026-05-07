@@ -16,7 +16,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from financial_kg.storage.json_store import load_graph
 from financial_kg.storage.task_db import TaskDB
-from financial_kg.engine.snapshot import SnapshotDiff
+from financial_kg.engine.snapshot import SnapshotDiff, create_snapshot
 from financial_kg.engine.workspace import (
     WorkspaceState,
     load_workspace,
@@ -114,8 +114,6 @@ editor_col, results_col = st.columns([3, 2])
 def _build_param_cells(graph):
     rows = []
     for cid, cell in graph.cells.items():
-        if cell.formula_raw:
-            continue
         ind_name = ""
         if cell.indicator_id and cell.indicator_id in graph.indicators:
             ind_name = graph.indicators[cell.indicator_id].name
@@ -127,6 +125,7 @@ def _build_param_cells(graph):
             "Indicator 名称": ind_name,
             "Table 名称": tbl_name,
             "Sheet": cell.sheet or "",
+            "类型": cell.data_type or "number",
             "当前值": cell.value,
         })
     return rows
@@ -148,17 +147,22 @@ with editor_col:
     st.subheader("📝 编辑参数")
 
     # Filter bar
-    filter_a, filter_b = st.columns([2, 1])
+    filter_a, filter_b, filter_c = st.columns([2, 1, 1])
     with filter_a:
         search_kw = st.text_input("搜索", placeholder="Cell ID / Indicator / Table", label_visibility="collapsed", key="p_search")
     with filter_b:
         selected_sheets = st.multiselect("Sheet", all_sheets, default=[], label_visibility="collapsed", key="p_sheets")
+    with filter_c:
+        all_types = sorted(set(r["类型"] for r in all_param_cells if r["类型"]))
+        selected_types = st.multiselect("类型", all_types, default=["number"], label_visibility="collapsed", key="p_types")
 
     # Build filtered list
     filtered = []
     for r in all_param_cells:
         cid = r["Cell ID"]
         if selected_sheets and r["Sheet"] not in selected_sheets:
+            continue
+        if selected_types and r["类型"] not in selected_types:
             continue
         if search_kw:
             kw = search_kw.lower()
@@ -193,6 +197,7 @@ with editor_col:
                 "Indicator 名称": st.column_config.TextColumn("Indicator", disabled=True),
                 "Table 名称": st.column_config.TextColumn("Table", disabled=True),
                 "Sheet": st.column_config.TextColumn("Sheet", disabled=True, width="small"),
+                "类型": st.column_config.TextColumn("类型", disabled=True, width="small"),
                 "当前值": st.column_config.NumberColumn("当前值", disabled=True, width="small"),
                 "场景值": st.column_config.NumberColumn("场景值", width="small"),
             },
@@ -248,10 +253,16 @@ with editor_col:
                 with st.spinner("重算中..."):
                     result = apply_and_recalc(working_graph, ws, base_graph)
 
+                # Create snapshot for comparison page
+                from datetime import datetime as _dt
+                snap_name = f"{ws.active_scenario}_{_dt.now().strftime('%Y%m%d_%H%M%S')}"
+                snap = create_snapshot(working_graph, task.id, snap_name)
+                db.save_snapshot(str(uuid.uuid4())[:8], task.id, snap_name, snap.filepath)
+
                 st.session_state[f"wg_{task.id}"] = working_graph
                 st.session_state[f"rr_{task.id}"] = result
                 st.session_state[f"auto_viz_{task.id}"] = True
-                st.toast(f"重算完成：{result.affected_count} 个变化", icon="✅")
+                st.toast(f"重算完成：{result.affected_count} 个变化，快照「{snap_name}」已保存", icon="✅")
                 st.rerun()
     else:
         st.info("无匹配参数，请调整筛选条件")
