@@ -1,6 +1,7 @@
-"""Page 3: Parameter workspace — three-column layout, tab-based scenarios."""
+"""Page 3: Parameter workspace — two-column editor + results."""
 from __future__ import annotations
 import copy
+import json
 import os
 import sys
 import uuid
@@ -30,25 +31,23 @@ from financial_kg.viz.echarts_template import render_propagation_html
 
 st.set_page_config(layout="wide")
 
-# ── Top bar: task + scenario tabs ────────────────────────────────────────────
+# ── Top bar ──────────────────────────────────────────────────────────────────
+
+st.title("⚙️ 参数工作台")
 
 db = TaskDB()
 tasks = [t for t in db.list_tasks() if t.status == "done"]
 
 if not tasks:
-    st.title("⚙️ 参数工作台")
     st.warning("暂无已解析的任务。")
     st.stop()
 
-top_bar = st.container()
-with top_bar:
-    col_task, col_new = st.columns([3, 1])
-    with col_task:
-        task_options = {f"{t.id} — {t.filename}": t for t in tasks}
-        selected_label = st.selectbox("选择任务", list(task_options.keys()), label_visibility="collapsed")
-        task = task_options[selected_label]
-    with col_new:
-        new_scenario_name = st.text_input("新场景", placeholder="输入名称后点 +", label_visibility="collapsed")
+top_row = st.columns([3, 2, 1, 1])
+
+with top_row[0]:
+    task_options = {f"{t.id} — {t.filename}": t for t in tasks}
+    selected_label = st.selectbox("任务", list(task_options.keys()), label_visibility="collapsed")
+    task = task_options[selected_label]
 
 @st.cache_resource(show_spinner="加载图谱...")
 def _load_base(task_id: str, output_dir: str):
@@ -58,56 +57,60 @@ def _load_base(task_id: str, output_dir: str):
 base_graph = _load_base(task.id, task.output_dir)
 ws: WorkspaceState = load_workspace(task.id)
 
-# Sync pending edits that may exist in workspace but not yet shown
-if f"pending_{ws.active_scenario}" not in st.session_state:
-    st.session_state[f"pending_{ws.active_scenario}"] = dict(ws.pending_edits)
-
-# ── Scenario tabs using st.tabs ──────────────────────────────────────────────
+# ── Scenario button row ─────────────────────────────────────────────────────
 
 scenario_names = list(ws.scenarios.keys())
-scenario_tabs = st.tabs(scenario_names + ["+"])
+scenario_cols = st.columns([len(s) * 2 + 3 for s in scenario_names] + [8, 4])
 
-# Track which tab is active via session state
-_active_tab_key = f"active_tab_{task.id}"
 for i, sname in enumerate(scenario_names):
-    with scenario_tabs[i]:
-        if st.button(sname, key=f"activate_{sname}", use_container_width=True, type="primary" if sname == ws.active_scenario else "secondary"):
+    with scenario_cols[i]:
+        is_active = (sname == ws.active_scenario)
+        label = f"● {sname}" if is_active else f"○ {sname}"
+        btn_type = "primary" if is_active else "secondary"
+        if st.button(label, type=btn_type, use_container_width=True, key=f"scn_{sname}"):
             ws.active_scenario = sname
             save_workspace(ws)
-            st.session_state[_active_tab_key] = sname
             st.rerun()
 
-with scenario_tabs[-1]:
-    if st.button("+ 新建", key="new_scenario_btn", use_container_width=True):
-        if new_scenario_name.strip() and new_scenario_name not in ws.scenarios:
-            ws.scenarios[new_scenario_name.strip()] = Scenario(
+with scenario_cols[len(scenario_names)]:
+    new_name = st.text_input("新场景", placeholder="名称", label_visibility="collapsed")
+
+with scenario_cols[len(scenario_names) + 1]:
+    if st.button("+ 新建", use_container_width=True, key="scn_new"):
+        if new_name.strip() and new_name not in ws.scenarios:
+            ws.scenarios[new_name.strip()] = Scenario(
                 id=str(uuid.uuid4())[:8],
                 task_id=task.id,
-                name=new_scenario_name.strip(),
+                name=new_name.strip(),
                 created_at=datetime.now(timezone.utc).isoformat(),
             )
-            ws.active_scenario = new_scenario_name.strip()
+            ws.active_scenario = new_name.strip()
             save_workspace(ws)
             st.rerun()
-        elif new_scenario_name.strip():
-            st.toast("场景名称已存在", icon="⚠️")
+        elif new_name.strip():
+            st.toast("场景已存在", icon="⚠️")
 
-# Delete button — small button near tabs
+# Delete row
 if len(ws.scenarios) > 1:
-    delete_col, _ = st.columns([1, 10])
-    with delete_col:
-        if st.button("🗑 删除当前", key="del_scenario", help=f"删除场景「{ws.active_scenario}」"):
+    _, del_btn, _ = st.columns([8, 2, 8])
+    with del_btn:
+        if st.button(f"🗑 删除「{ws.active_scenario}」", type="secondary", use_container_width=True, key="scn_del"):
             if ws.active_scenario != "基准":
                 del ws.scenarios[ws.active_scenario]
                 ws.active_scenario = "基准"
                 save_workspace(ws)
                 st.rerun()
             else:
-                st.toast("不能删除基准场景", icon="⚠️")
+                st.toast("不能删除基准", icon="⚠️")
 
-# ── Main three-column layout ─────────────────────────────────────────────────
+st.divider()
 
-# Build parameter cell data
+# ── Main two-column layout ──────────────────────────────────────────────────
+
+editor_col, results_col = st.columns([3, 2])
+
+# ── Shared data ──────────────────────────────────────────────────────────────
+
 def _build_param_cells(graph):
     rows = []
     for cid, cell in graph.cells.items():
@@ -135,26 +138,24 @@ def _cached_param_cells(task_id: str, output_dir: str):
 
 all_param_cells = _cached_param_cells(task.id, task.output_dir)
 all_sheets = sorted(set(r["Sheet"] for r in all_param_cells if r["Sheet"]))
-
-# ── Left column: parameter browser ───────────────────────────────────────────
-# ── Center column: edit table ────────────────────────────────────────────────
-# ── Right column: results (tabs) ─────────────────────────────────────────────
-
-left_col, center_col, right_col = st.columns([2, 4, 4])
+cell_lookup = {r["Cell ID"]: r for r in all_param_cells}
 
 scenario = ws.scenarios.get(ws.active_scenario)
-scenario_override_ids = set(scenario.overrides.keys()) if scenario else set()
 
-# ── Left: search + filter + quick-select ─────────────────────────────────────
+# ── Left: Editor workspace ──────────────────────────────────────────────────
 
-with left_col:
-    st.subheader("参数浏览")
+with editor_col:
+    st.subheader("📝 编辑参数")
 
-    search_kw = st.text_input("搜索", placeholder="Cell ID / Indicator / Table", key="param_search")
-    selected_sheets = st.multiselect("按 Sheet 筛选", all_sheets, default=[], key="param_sheets")
+    # Filter bar
+    filter_a, filter_b = st.columns([2, 1])
+    with filter_a:
+        search_kw = st.text_input("搜索", placeholder="Cell ID / Indicator / Table", label_visibility="collapsed", key="p_search")
+    with filter_b:
+        selected_sheets = st.multiselect("Sheet", all_sheets, default=[], label_visibility="collapsed", key="p_sheets")
 
     # Build filtered list
-    filtered_ids = set()
+    filtered = []
     for r in all_param_cells:
         cid = r["Cell ID"]
         if selected_sheets and r["Sheet"] not in selected_sheets:
@@ -163,50 +164,11 @@ with left_col:
             kw = search_kw.lower()
             if kw not in cid.lower() and kw not in r["Indicator 名称"].lower() and kw not in r["Table 名称"].lower():
                 continue
-        filtered_ids.add(cid)
-
-    # Quick mode: show all filtered, or just modified
-    show_mode = st.radio("显示模式", ["仅已修改", "全部参数"], horizontal=True, key="show_mode")
-
-    if show_mode == "仅已修改":
-        display_ids = [cid for cid in filtered_ids if cid in scenario_override_ids or cid in st.session_state.get(f"pending_{ws.active_scenario}", {})]
-    else:
-        display_ids = sorted(filtered_ids)
-
-    st.caption(f"共 {len(display_ids)} 个参数")
-
-    if display_ids:
-        # Show as clickable list — click to jump to edit table row
-        lookup = {r["Cell ID"]: r for r in all_param_cells}
-        for cid in display_ids[:200]:
-            info = lookup.get(cid, {})
-            is_modified = cid in scenario_override_ids or cid in st.session_state.get(f"pending_{ws.active_scenario}", {})
-            label = f"{cid}"
-            if info.get("Indicator 名称"):
-                label += f" — {info['Indicator 名称']}"
-            if is_modified:
-                st.markdown(f"**{label}**")
-            else:
-                st.markdown(label)
-
-        if len(display_ids) > 200:
-            st.caption(f"仅显示前 200 个，共 {len(display_ids)} 个")
-    else:
-        st.info("无匹配参数")
-
-# ── Center: editable table ───────────────────────────────────────────────────
-
-with center_col:
-    st.subheader("编辑参数")
+        filtered.append(r)
 
     # Build dataframe
-    if display_ids:
-        cell_data = [lookup[cid] for cid in display_ids if cid in lookup]
-    else:
-        cell_data = []
-
-    if cell_data:
-        df = pd.DataFrame(cell_data)
+    if filtered:
+        df = pd.DataFrame(filtered)
         df["场景值"] = df["当前值"].copy()
 
         # Pre-fill scenario overrides
@@ -236,7 +198,7 @@ with center_col:
             },
             use_container_width=True,
             hide_index=True,
-            key=f"param_editor_{ws.active_scenario}",
+            key=f"pedit_{ws.active_scenario}",
         )
 
         # Detect changes
@@ -245,7 +207,6 @@ with center_col:
             cid = row["Cell ID"]
             new_val = row["场景值"]
             old_val = row["当前值"]
-            # Compare with tolerance for floats
             try:
                 if abs(float(new_val) - float(old_val)) > 1e-9:
                     new_pending[cid] = new_val
@@ -256,29 +217,28 @@ with center_col:
         st.session_state[pending_key] = new_pending
         ws.pending_edits = new_pending
 
-        # Action bar
-        action_bar = st.container()
-        with action_bar:
-            act_cols = st.columns([1, 1, 1, 2])
-            with act_cols[0]:
-                st.metric("已修改", len(new_pending))
-            with act_cols[1]:
-                if st.button("清空修改", use_container_width=True):
+        # Status metrics
+        st.metric("已修改", len(new_pending))
+
+        # Action buttons
+        act_a, act_b, act_c = st.columns([1, 1, 2])
+        with act_a:
+            if st.button("清空修改", use_container_width=True):
+                st.session_state[pending_key] = {}
+                ws.pending_edits = {}
+                save_workspace(ws)
+                st.rerun()
+        with act_b:
+            if st.button("保存到场景", use_container_width=True):
+                if scenario and new_pending:
+                    scenario.overrides.update(new_pending)
                     st.session_state[pending_key] = {}
                     ws.pending_edits = {}
                     save_workspace(ws)
+                    st.toast(f"已保存 {len(new_pending)} 个修改到「{ws.active_scenario}」", icon="💾")
                     st.rerun()
-            with act_cols[2]:
-                if st.button("保存到场景", use_container_width=True):
-                    if scenario and new_pending:
-                        scenario.overrides.update(new_pending)
-                        st.session_state[pending_key] = {}
-                        ws.pending_edits = {}
-                        save_workspace(ws)
-                        st.toast(f"已保存 {len(new_pending)} 个修改到「{ws.active_scenario}」", icon="💾")
-                        st.rerun()
-            with act_cols[3]:
-                apply_clicked = st.button("🔄 应用并重算", type="primary", use_container_width=True)
+        with act_c:
+            apply_clicked = st.button("🔄 应用并重算", type="primary", use_container_width=True)
 
         if apply_clicked:
             if not new_pending and not (scenario and scenario.overrides):
@@ -288,43 +248,41 @@ with center_col:
                 with st.spinner("重算中..."):
                     result = apply_and_recalc(working_graph, ws, base_graph)
 
-                st.session_state[f"working_graph_{task.id}"] = working_graph
-                st.session_state[f"recalc_result_{task.id}"] = result
-                st.session_state[f"auto_recalc_done_{task.id}"] = True
+                st.session_state[f"wg_{task.id}"] = working_graph
+                st.session_state[f"rr_{task.id}"] = result
+                st.session_state[f"auto_viz_{task.id}"] = True
                 st.toast(f"重算完成：{result.affected_count} 个变化", icon="✅")
                 st.rerun()
     else:
-        st.info("左侧选择显示模式为「全部参数」以浏览所有参数单元格")
+        st.info("无匹配参数，请调整筛选条件")
 
-# ── Right: results panel with tabs ───────────────────────────────────────────
+# ── Right: Results panel ────────────────────────────────────────────────────
 
-recalc_result = st.session_state.get(f"recalc_result_{task.id}")
-working_graph = st.session_state.get(f"working_graph_{task.id}")
+recalc_result = st.session_state.get(f"rr_{task.id}")
+working_graph = st.session_state.get(f"wg_{task.id}")
 
-with right_col:
-    st.subheader("结果面板")
+with results_col:
+    st.subheader("📊 结果面板")
 
-    result_tabs = st.tabs(["📊 关键指标", "🔗 影响链", "📜 修改历史"])
+    r_tabs = st.tabs(["关键指标", "影响链", "修改历史"])
 
     # ── Tab 1: Key metrics ───────────────────────────────────────────────
-    with result_tabs[0]:
-        if recalc_result is not None and working_graph is not None:
-            key_ind_ids = get_key_metrics(base_graph)
-            if key_ind_ids:
-                cols_per_row = 3
-                n_rows = (min(len(key_ind_ids), 9) + cols_per_row - 1) // cols_per_row
-                for row_idx in range(n_rows):
-                    metric_cols = st.columns(cols_per_row)
-                    start = row_idx * cols_per_row
-                    end = min(start + cols_per_row, min(len(key_ind_ids), 9))
-                    for i, ind_id in enumerate(key_ind_ids[start:end]):
-                        col = metric_cols[i]
+    with r_tabs[0]:
+        if recalc_result and working_graph:
+            key_ids = get_key_metrics(base_graph)
+            if key_ids:
+                for row_idx in range(min(len(key_ids), 9), 0, -3):
+                    pass
+                n_show = min(len(key_ids), 9)
+                for ri in range((n_show + 2) // 3):
+                    mc = st.columns(3)
+                    for j, ind_id in enumerate(key_ids[ri * 3:(ri + 1) * 3]):
                         ind = base_graph.indicators.get(ind_id)
-                        if ind is None:
+                        if not ind:
                             continue
                         old_val = ind.summary_value
-                        working_ind = working_graph.indicators.get(ind_id)
-                        new_val = working_ind.summary_value if working_ind else old_val
+                        w_ind = working_graph.indicators.get(ind_id)
+                        new_val = w_ind.summary_value if w_ind else old_val
 
                         delta = None
                         delta_pct = None
@@ -338,7 +296,7 @@ with right_col:
                             except (ValueError, TypeError):
                                 pass
 
-                        with col:
+                        with mc[j]:
                             st.metric(
                                 label=ind.name or ind_id,
                                 value=new_val if new_val is not None else "—",
@@ -346,63 +304,59 @@ with right_col:
                                 delta_color="inverse" if delta is not None and delta < 0 else "normal",
                             )
 
-                # All changed indicators table
-                affected_ind_ids: set[str] = set()
+                # Affected indicators table
+                aff_ids: set[str] = set()
                 for cc in recalc_result.changed_cells:
                     cell = working_graph.cells.get(cc.cell_id)
                     if cell and cell.indicator_id:
-                        affected_ind_ids.add(cell.indicator_id)
+                        aff_ids.add(cell.indicator_id)
 
-                if affected_ind_ids:
-                    with st.expander(f"全部受影响 Indicator（{len(affected_ind_ids)} 个）"):
-                        ind_rows = []
-                        for ind_id in sorted(affected_ind_ids):
-                            base_ind = base_graph.indicators.get(ind_id)
-                            work_ind = working_graph.indicators.get(ind_id)
-                            ind_rows.append({
-                                "Indicator": base_ind.name if base_ind else ind_id,
-                                "Sheet": base_ind.sheet if base_ind else "",
-                                "旧汇总值": base_ind.summary_value if base_ind else None,
-                                "新汇总值": work_ind.summary_value if work_ind else None,
+                if aff_ids:
+                    with st.expander(f"全部受影响 Indicator（{len(aff_ids)} 个）"):
+                        irows = []
+                        for iid in sorted(aff_ids):
+                            bi = base_graph.indicators.get(iid)
+                            wi = working_graph.indicators.get(iid)
+                            irows.append({
+                                "Indicator": bi.name if bi else iid,
+                                "旧值": bi.summary_value if bi else None,
+                                "新值": wi.summary_value if wi else None,
                             })
-                        st.dataframe(ind_rows, use_container_width=True, hide_index=True)
+                        st.dataframe(irows, use_container_width=True, hide_index=True)
 
                 if recalc_result.error_cells:
                     with st.expander(f"求值失败（{len(recalc_result.error_cells)} 个）"):
                         st.write(recalc_result.error_cells[:50])
             else:
-                st.info("未找到关键指标（需包含 NPV/IRR/投资/利润 等关键词）")
+                st.info("未找到关键指标")
         else:
-            st.info("点击「应用并重算」后此处显示关键指标变化")
+            st.info("重算后显示指标变化")
 
     # ── Tab 2: Impact chain ──────────────────────────────────────────────
-    with result_tabs[1]:
-        if recalc_result is not None and working_graph is not None:
-            changed_cell_ids = [c.cell_id for c in recalc_result.changed_cells]
-            if changed_cell_ids:
-                # Auto-select first changed cell as root
-                if f"viz_root_{task.id}" not in st.session_state:
-                    st.session_state[f"viz_root_{task.id}"] = changed_cell_ids[0]
+    with r_tabs[1]:
+        if recalc_result and working_graph:
+            changed_ids = [c.cell_id for c in recalc_result.changed_cells]
+            if changed_ids:
+                if f"vizr_{task.id}" not in st.session_state:
+                    st.session_state[f"vizr_{task.id}"] = changed_ids[0]
 
                 viz_root = st.selectbox(
                     "传播起点",
-                    changed_cell_ids,
-                    index=changed_cell_ids.index(st.session_state[f"viz_root_{task.id}"]) if st.session_state.get(f"viz_root_{task.id}") in changed_cell_ids else 0,
-                    format_func=lambda cid: f"{cid} ({base_graph.cells[cid].value if cid in base_graph.cells else ''})",
+                    changed_ids,
+                    index=changed_ids.index(st.session_state[f"vizr_{task.id}"]) if st.session_state.get(f"vizr_{task.id}") in changed_ids else 0,
+                    format_func=lambda c: f"{c}",
                 )
-                st.session_state[f"viz_root_{task.id}"] = viz_root
+                st.session_state[f"vizr_{task.id}"] = viz_root
 
-                viz_col_a, viz_col_b = st.columns([1, 1])
-                with viz_col_a:
-                    depth = st.slider("最大深度", 1, 15, 5, key="viz_depth")
-                with viz_col_b:
-                    max_nodes = st.slider("最大节点数", 50, 2000, 500, key="viz_max_nodes")
+                vd, vmn = st.columns(2)
+                with vd:
+                    depth = st.slider("深度", 1, 15, 5, key="vd2")
+                with vmn:
+                    max_n = st.slider("最大节点", 50, 2000, 500, key="vmn2")
 
-                # Auto-render on first load after recalc
-                should_render = st.session_state.get(f"auto_recalc_done_{task.id}", False)
-
-                if should_render or st.button("生成传播图", type="secondary"):
-                    st.session_state[f"auto_recalc_done_{task.id}"] = False
+                auto = st.session_state.get(f"auto_viz_{task.id}", False)
+                if auto or st.button("生成传播图", type="secondary"):
+                    st.session_state[f"auto_viz_{task.id}"] = False
 
                     diff_cells = []
                     for c in recalc_result.changed_cells:
@@ -416,61 +370,59 @@ with right_col:
                         })
 
                     pseudo_diff = SnapshotDiff(
+                        snapshot_a="修改前",
+                        snapshot_b="修改后",
                         changed_cells=diff_cells,
                         affected_indicators=[],
                         summary={"total_changed_cells": len(diff_cells), "total_changed_indicators": 0, "sheets_affected": []},
                     )
 
-                    data = build_propagation_data(base_graph, pseudo_diff, viz_root, max_depth=depth, max_nodes=max_nodes)
-                    html = render_propagation_html(data)
+                    data = build_propagation_data(base_graph, pseudo_diff, viz_root, max_depth=depth, max_nodes=max_n)
+                    html = render_propagation_html(json.dumps(data))
                     components.html(html, height=550, scrolling=True)
             else:
-                st.info("本次重算无变化单元格")
+                st.info("无变化单元格")
         else:
-            st.info("重算后此处自动显示影响链")
+            st.info("重算后显示影响链")
 
-    # ── Tab 3: Modification history ──────────────────────────────────────
-    with result_tabs[2]:
+    # ── Tab 3: History ───────────────────────────────────────────────────
+    with r_tabs[2]:
         if ws.history:
-            sorted_history = sorted(ws.history, key=lambda r: r.timestamp, reverse=True)[:100]
+            sorted_hist = sorted(ws.history, key=lambda r: r.timestamp, reverse=True)[:100]
 
-            # Show as table with per-row rollback
-            hist_rows = []
-            for r in sorted_history:
-                hist_rows.append({
+            hrows = []
+            for r in sorted_hist:
+                hrows.append({
                     "时间": r.timestamp[:19],
                     "场景": r.scenario,
                     "Cell ID": r.cell_id,
-                    "Indicator": r.indicator_name,
                     "旧值": r.old_value,
                     "新值": r.new_value,
                 })
+            st.dataframe(hrows, use_container_width=True, hide_index=True, height=250)
 
-            st.dataframe(hist_rows, use_container_width=True, hide_index=True, height=300)
-
-            # Rollback buttons — inline with each record
-            st.caption("回滚最近 10 条记录：")
-            rb_cols = st.columns(min(len(sorted_history[:10]), 5))
-            for i, r in enumerate(sorted_history[:10]):
-                with rb_cols[i % 5]:
-                    short_cid = r.cell_id[:15] + "..." if len(r.cell_id) > 15 else r.cell_id
-                    if st.button(f"↩ {short_cid}", key=f"rb_{r.id}", help=f"回滚 {r.cell_id} 到 {r.old_value}", use_container_width=True):
+            st.caption("回滚最近 10 条：")
+            rc = st.columns(min(len(sorted_hist[:10]), 5))
+            for i, r in enumerate(sorted_hist[:10]):
+                with rc[i % 5]:
+                    sc = r.cell_id[:15] + "…" if len(r.cell_id) > 15 else r.cell_id
+                    if st.button(f"↩ {sc}", key=f"rb2_{r.id}", use_container_width=True):
                         updates = rollback_record(ws, r.id)
                         if updates is not None:
                             wg = copy.deepcopy(base_graph)
                             with st.spinner("回滚中..."):
-                                result = apply_and_recalc(wg, ws, base_graph)
-                            st.session_state[f"working_graph_{task.id}"] = wg
-                            st.session_state[f"recalc_result_{task.id}"] = result
+                                result = apply_and_recalc(wg, ws, base_graph, record_history=False)
+                            st.session_state[f"wg_{task.id}"] = wg
+                            st.session_state[f"rr_{task.id}"] = result
                             st.toast(f"已回滚 {r.cell_id}", icon="↩️")
                             st.rerun()
                         else:
                             st.toast("回滚失败", icon="❌")
 
             if len(ws.history) > 100:
-                st.caption(f"仅显示最近 100 条，共 {len(ws.history)} 条")
+                st.caption(f"仅显示 100 条，共 {len(ws.history)} 条")
 
-            if st.button("清空历史（保留最近 10 条）", key="clear_hist"):
+            if st.button("清空历史（保留 10 条）", key="ch2"):
                 ws.history = ws.history[-10:]
                 save_workspace(ws)
                 st.rerun()
