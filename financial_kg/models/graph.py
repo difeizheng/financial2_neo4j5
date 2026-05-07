@@ -53,8 +53,6 @@ class FinancialGraph:
     def add_table(self, table: Table) -> None:
         self.tables[table.id] = table
 
-    # ── Stats ────────────────────────────────────────────────────────────────
-
     # ── Orphan cells (no table association) ─────────────────────────────────
 
     def get_unlinked_cells(self) -> dict[str, list[str]]:
@@ -70,6 +68,25 @@ class FinancialGraph:
 
     def unlinked_cell_count(self) -> int:
         return sum(1 for c in self.cells.values() if c.table_id is None)
+
+    # ── Cycle detection ─────────────────────────────────────────────────────
+
+    def has_cycles(self) -> tuple[bool, int, list[str]]:
+        """Detect cycles in the cell dependency graph.
+
+        Returns (has_cycles, cycle_count, list_of_cell_ids_in_cycles).
+        Limited to first 100 cycles for performance.
+        """
+        try:
+            cycles = list(nx.simple_cycles(self.cell_graph))
+            if not cycles:
+                return False, 0, []
+            cycle_cells: set[str] = set()
+            for cycle in cycles[:100]:
+                cycle_cells.update(cycle)
+            return True, len(cycles), list(cycle_cells)
+        except nx.NetworkXError:
+            return False, 0, []
 
     # ── Stats ────────────────────────────────────────────────────────────────
 

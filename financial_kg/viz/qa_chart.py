@@ -144,3 +144,59 @@ window.addEventListener('resize', function() {{ chart.resize(); }});
 </script>
 </body>
 </html>"""
+
+
+def render_pie_chart_html(
+    labels: list[str],
+    values: list[int | float],
+    title: str = "",
+    height: str = "300px",
+    echarts_cdn: str = _ECHARTS_CDN,
+    chart_type: str = "pie",  # "pie" | "doughnut"
+) -> str:
+    """Render an ECharts pie/doughnut chart for distribution data."""
+    radius = '["40%", "70%"]' if chart_type == "doughnut" else '"70%"'
+
+    data_items = []
+    for i, (label, value) in enumerate(zip(labels, values)):
+        color = _COLORS[i % len(_COLORS)]
+        data_items.append({"value": value, "name": label, "itemStyle": {"color": color}})
+
+    data_json = json.dumps(data_items, ensure_ascii=False)
+
+    opt = {
+        "title": {"text": title, "textStyle": {"color": "#cdd6f4", "fontSize": 13}, "left": "center"},
+        "tooltip": {"trigger": "item", "backgroundColor": "#1e1e2e", "borderColor": "#313244", "textStyle": {"color": "#cdd6f4"}, "formatter": "{b}: {c} ({d}%)"},
+        "legend": {"orient": "vertical", "right": 10, "top": "center", "textStyle": {"color": "#a6adc8"}, "type": "scroll"},
+        "series": [{
+            "type": "pie",
+            "radius": radius,
+            "center": ["40%", "50%"],
+            "avoidLabelOverlap": True,
+            "data": data_items,
+            "label": {"show": True, "color": "#a6adc8", "formatter": "{b}\n{d}%"},
+            "labelLine": {"show": True, "lineStyle": {"color": "#585b70"}},
+        }],
+    }
+    opt_json = json.dumps(opt, ensure_ascii=False)
+
+    return f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+  body {{ background: #181825; height: {height}; }}
+  #chart {{ width: 100%; height: {height}; }}
+</style>
+</head>
+<body>
+<div id="chart"></div>
+<script src="{echarts_cdn}"></script>
+<script>
+var chart = echarts.init(document.getElementById('chart'), 'dark', {{renderer: 'canvas'}});
+chart.setOption({opt_json});
+window.addEventListener('resize', function() {{ chart.resize(); }});
+</script>
+</body>
+</html>"""
