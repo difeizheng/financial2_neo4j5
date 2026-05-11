@@ -274,10 +274,21 @@ with editor_col:
                 st.toast("暂无修改可应用", icon="ℹ️")
             else:
                 working_graph = copy.deepcopy(base_graph)
+
+                # Ensure a "before" snapshot exists for comparison
+                base_snap_key = f"base_snap_{task.id}_{ws.active_scenario}"
+                base_snap_name = st.session_state.get(base_snap_key)
+                if not base_snap_name:
+                    base_snap_name = f"基准_{ws.active_scenario}"
+                    base_snap = create_snapshot(base_graph, task.id, base_snap_name)
+                    db.save_snapshot(str(uuid.uuid4())[:8], task.id, base_snap_name, base_snap.filepath)
+                    st.session_state[base_snap_key] = base_snap_name
+                    st.toast(f"已保存基准快照「{base_snap_name}」", icon="📸")
+
                 with st.spinner("重算中..."):
                     result = apply_and_recalc(working_graph, ws, base_graph)
 
-                # Create snapshot for comparison page
+                # Create "after" snapshot for comparison page
                 from datetime import datetime as _dt
                 snap_name = f"{ws.active_scenario}_{_dt.now().strftime('%Y%m%d_%H%M%S')}"
                 snap = create_snapshot(working_graph, task.id, snap_name)
@@ -286,7 +297,7 @@ with editor_col:
                 st.session_state[f"wg_{task.id}"] = working_graph
                 st.session_state[f"rr_{task.id}"] = result
                 st.session_state[f"auto_viz_{task.id}"] = True
-                st.toast(f"重算完成：{result.affected_count} 个变化，快照「{snap_name}」已保存", icon="✅")
+                st.toast(f"重算完成：{result.affected_count} 个变化，快照「{snap_name}」已保存（可与「{base_snap_name}」对比）", icon="✅")
                 st.rerun()
 
 # ── Right: Results panel ────────────────────────────────────────────────────
