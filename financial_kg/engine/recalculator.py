@@ -3,14 +3,19 @@
 Given a set of changed cells (with new values), propagates changes through
 the dependency DAG and updates the graph in-place.  Also syncs the Indicator
 layer (summary_value, time_series).
+
+When circular dependencies exist, iterative evaluation converges within the
+strongly connected component (max 100 iterations, tolerance 1e-9).
 """
 from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+import networkx as nx
+
 from financial_kg.models.graph import FinancialGraph
-from financial_kg.engine.dependency import downstream_cells, build_subgraph_order
-from financial_kg.engine.evaluator import evaluate_cell
+from financial_kg.engine.dependency import downstream_cells
+from financial_kg.engine.evaluator import evaluate_cell, clear_formula_cache
 
 
 @dataclass
@@ -25,26 +30,35 @@ class CellChange:
 class RecalcResult:
     changed_cells: list[CellChange] = field(default_factory=list)
     error_cells: list[str] = field(default_factory=list)
+    scc_iterations: int = 0
 
     @property
     def affected_count(self) -> int:
         return len(self.changed_cells)
 
 
+
 def recalculate(
     graph: FinancialGraph,
     updates: dict[str, Any],  # cell_id -> new_value
+    max_iter: int = 100,
+    tol: float = 1e-9,
 ) -> RecalcResult:
     """Apply updates and propagate through the dependency graph.
 
     Args:
         graph: The FinancialGraph to mutate in-place.
         updates: Mapping of cell_id → new value for the seed cells.
+        max_iter: Maximum SCC iteration rounds.
+        tol: Convergence tolerance for SCC iterations.
 
     Returns:
         RecalcResult with all cells that changed value.
     """
     result = RecalcResult()
+
+    # Clear formula cache for this recalculation session
+    clear_formula_cache()
 
     # 1. Apply seed changes
     for cell_id, new_val in updates.items():
@@ -61,7 +75,21 @@ def recalculate(
     # 2. Find all downstream cells in topological order
     affected = downstream_cells(graph, updates.keys())
 
-    # 3. Re-evaluate each affected formula cell
+    # 3. Detect cyclic groups within affected cells
+    g = graph.cell_graph
+    affected_set = set(affected)
+    sccs: list[list[str]] = []
+    try:
+        subgraph = g.subgraph(affected_set | set(updates.keys()))
+        for scc in nx.strongly_connected_components(subgraph):
+            in_affected = sorted(scc & affected_set)
+            if len(in_affected) > 1:
+                sccs.append(in_affected)
+    except Exception:
+        pass
+    cyclic_cells = {c for group in sccs for c in group}
+
+    # 4. Re-evaluate each affected formula cell (single pass for acyclic)
     for cell_id in affected:
         cell = graph.cells.get(cell_id)
         if cell is None or not cell.formula_raw:
@@ -80,7 +108,66 @@ def recalculate(
                 CellChange(cell_id, old_val, new_val, cell.formula_raw)
             )
 
-    # 4. Sync Indicator layer for all changed cells
+    # 5. Iteratively converge cyclic cells
+    if cyclic_cells:
+        iteration_count = 0
+        for iteration_count in range(1, max_iter + 1):
+            max_delta = 0.0
+            for cell_id in affected:
+                if cell_id not in cyclic_cells:
+                    continue
+                cell = graph.cells.get(cell_id)
+                if cell is None or not cell.formula_raw:
+                    continue
+
+                old_val = cell.value
+                new_val = evaluate_cell(cell_id, graph)
+
+                if new_val is None:
+                    continue
+
+                cell.value = new_val
+                try:
+                    max_delta = max(max_delta, abs(float(new_val) - float(old_val)))
+                except (TypeError, ValueError):
+                    max_delta = 1.0
+
+            if max_delta <= tol:
+                break
+
+        result.scc_iterations = iteration_count
+
+        # Re-evaluate non-cyclic cells that depend on converged cycle cells
+        for cell_id in affected:
+            if cell_id in cyclic_cells:
+                continue
+            cell = graph.cells.get(cell_id)
+            if cell is None or not cell.formula_raw:
+                continue
+            old_val = cell.value
+            new_val = evaluate_cell(cell_id, graph)
+            if new_val is not None:
+                cell.value = new_val
+
+        # Final pass: re-evaluate cyclic cells after non-cyclic deps resolved.
+        # Some cyclic cells depend on non-cyclic predecessors (e.g. N60=N58+N59
+        # where N58 is non-cyclic and only updated in step 6 above).
+        for cell_id in affected:
+            if cell_id not in cyclic_cells:
+                continue
+            cell = graph.cells.get(cell_id)
+            if cell is None or not cell.formula_raw:
+                continue
+            new_val = evaluate_cell(cell_id, graph)
+            if new_val is not None:
+                old_val = cell.value
+                cell.value = new_val
+                if old_val != new_val:
+                    result.changed_cells.append(
+                        CellChange(cell_id, old_val, new_val, cell.formula_raw)
+                    )
+
+    # 6. Sync Indicator layer for all changed cells
     _sync_indicators(graph, result.changed_cells)
 
     return result
