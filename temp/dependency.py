@@ -36,13 +36,15 @@ def topological_order(graph: FinancialGraph) -> list[str]:
 def downstream_cells(graph: FinancialGraph, changed_ids: Iterable[str]) -> list[str]:
     """BFS from changed_ids; return all downstream (dependent) cell IDs in topological order.
 
-    Optimized: uses direct in-degree computation on BFS-discovered set instead
-    of building a NetworkX subgraph copy. Falls back to SCC grouping only when
-    the affected subgraph contains cycles.
+    The returned list excludes the seed cells themselves and is sorted so that
+    each cell appears after all its predecessors.
 
     Note: Edge direction is A → B meaning "A depends on B".
     So to find cells that depend on B (i.e., will be affected when B changes),
     we must look at PREDECESSORS of B, not successors.
+
+    When cycles exist, the fallback order groups strongly connected components
+    together so the caller can use iterative evaluation.
     """
     g = graph.cell_graph
     seeds = set(changed_ids)
@@ -59,56 +61,24 @@ def downstream_cells(graph: FinancialGraph, changed_ids: Iterable[str]) -> list[
     if not visited:
         return []
 
-    # Direct Kahn's on visited+seeds — avoids nx.subgraph() copy
-    all_nodes = visited | seeds
+    subgraph = g.subgraph(visited | seeds)
+    try:
+        full_order = list(nx.topological_sort(subgraph))
+    except nx.NetworkXUnfeasible:
+        full_order = _scc_topological_order(subgraph, visited)
 
-    # Compute in-degree within affected set (count edges where BOTH endpoints in set)
-    in_degree: dict[str, int] = {n: 0 for n in all_nodes}
-    adj: dict[str, list[str]] = {n: [] for n in all_nodes}
-    for node in all_nodes:
-        for successor in g.successors(node):
-            if successor in all_nodes:
-                # node depends on successor → edge: node → successor
-                # In evaluation order: successor must come first
-                adj[successor].append(node)
-                in_degree[node] += 1
-
-    topo_queue = deque(n for n, d in in_degree.items() if d == 0)
-    order: list[str] = []
-
-    while topo_queue:
-        node = topo_queue.popleft()
-        order.append(node)
-        for dep in adj[node]:
-            in_degree[dep] -= 1
-            if in_degree[dep] == 0:
-                topo_queue.append(dep)
-
-    if len(order) == len(all_nodes):
-        # Clean DAG — return topological order, exclude seeds
-        return [n for n in order if n in visited]
-
-    # Cycle detected — use SCC-based ordering
-    subgraph = g.subgraph(all_nodes)
-    scc_order = _scc_topological_order(subgraph, visited)
-    return scc_order
+    return [n for n in full_order if n in visited]
 
 
 def _scc_topological_order(subgraph: nx.DiGraph, visited: set[str]) -> list[str]:
-    """Return evaluation order that handles cycles via SCC grouping.
-
-    Cells within the same SCC are grouped together (caller should iterate
-    until convergence). The overall order respects dependencies between SCCs.
-    """
+    """Return evaluation order that handles cycles via SCC grouping."""
     sccs = list(nx.strongly_connected_components(subgraph))
 
-    # Build node -> SCC index mapping
     node_to_scc: dict[str, int] = {}
     for i, scc in enumerate(sccs):
         for node in scc:
             node_to_scc[node] = i
 
-    # Build meta-DAG
     meta_graph = nx.DiGraph()
     for i in range(len(sccs)):
         meta_graph.add_node(i)
@@ -120,10 +90,8 @@ def _scc_topological_order(subgraph: nx.DiGraph, visited: set[str]) -> list[str]
         for successor in subgraph.successors(node):
             dst_idx = node_to_scc.get(successor)
             if dst_idx is not None and src_idx != dst_idx:
-                # node depends on successor → successor's SCC should come first
                 meta_graph.add_edge(dst_idx, src_idx)
 
-    # Topological sort of meta-DAG, flatten
     try:
         meta_order = list(nx.topological_sort(meta_graph))
     except nx.NetworkXUnfeasible:
@@ -138,7 +106,6 @@ def _scc_topological_order(subgraph: nx.DiGraph, visited: set[str]) -> list[str]
         if len(scc_in_visited) == 1:
             result.append(next(iter(scc_in_visited)))
         else:
-            # Cyclic group: add all together
             result.extend(sorted(scc_in_visited))
 
     return result

@@ -5,7 +5,7 @@ the dependency DAG and updates the graph in-place.  Also syncs the Indicator
 layer (summary_value, time_series).
 
 When circular dependencies exist, iterative evaluation converges within the
-strongly connected component (max 100 iterations, tolerance 1e-9).
+strongly connected component (max 100 iterations, tolerance 1e-6).
 """
 from __future__ import annotations
 from dataclasses import dataclass, field
@@ -15,7 +15,7 @@ import networkx as nx
 
 from financial_kg.models.graph import FinancialGraph
 from financial_kg.engine.dependency import downstream_cells
-from financial_kg.engine.evaluator import evaluate_cell, clear_formula_cache
+from financial_kg.engine.evaluator import evaluate_cell
 
 
 @dataclass
@@ -37,28 +37,27 @@ class RecalcResult:
         return len(self.changed_cells)
 
 
-
 def recalculate(
     graph: FinancialGraph,
     updates: dict[str, Any],  # cell_id -> new_value
     max_iter: int = 100,
     tol: float = 1e-9,
+    scc_tol: float | None = None,
 ) -> RecalcResult:
     """Apply updates and propagate through the dependency graph.
 
-    Args:
-        graph: The FinancialGraph to mutate in-place.
-        updates: Mapping of cell_id → new value for the seed cells.
-        max_iter: Maximum SCC iteration rounds.
-        tol: Convergence tolerance for SCC iterations.
+    Three-pass convergence for mixed cyclic/acyclic graphs:
+    1. Evaluate all affected cells in topological order
+    2. SCC fixed-point convergence
+    3. Re-eval non-cyclic cells in topo order
+    4. Final SCC re-convergence
 
-    Returns:
-        RecalcResult with all cells that changed value.
+    No outer loop — bidirectional cyclic↔non-cyclic dependencies cause
+    oscillation. The 4-step sequence always terminates.
     """
+    if scc_tol is None:
+        scc_tol = max(tol, 1e-6)
     result = RecalcResult()
-
-    # Clear formula cache for this recalculation session
-    clear_formula_cache()
 
     # 1. Apply seed changes
     for cell_id, new_val in updates.items():
@@ -108,64 +107,67 @@ def recalculate(
                 CellChange(cell_id, old_val, new_val, cell.formula_raw)
             )
 
-    # 5. Iteratively converge cyclic cells
+    # 5. Converge circular dependencies (if any).
     if cyclic_cells:
-        iteration_count = 0
-        for iteration_count in range(1, max_iter + 1):
+        sorted_cyclic = sorted(cyclic_cells)
+        non_cyclic_affected = [c for c in affected if c not in cyclic_cells]
+
+        # 5a. SCC fixed-point convergence
+        for _iter in range(1, max_iter + 1):
             max_delta = 0.0
-            for cell_id in affected:
-                if cell_id not in cyclic_cells:
-                    continue
+            for cell_id in sorted_cyclic:
                 cell = graph.cells.get(cell_id)
                 if cell is None or not cell.formula_raw:
                     continue
-
                 old_val = cell.value
                 new_val = evaluate_cell(cell_id, graph)
-
                 if new_val is None:
                     continue
-
                 cell.value = new_val
                 try:
-                    max_delta = max(max_delta, abs(float(new_val) - float(old_val)))
+                    delta = abs(float(new_val) - float(old_val))
                 except (TypeError, ValueError):
-                    max_delta = 1.0
+                    delta = 1.0
+                max_delta = max(max_delta, delta)
 
-            if max_delta <= tol:
+            if max_delta <= scc_tol:
                 break
 
-        result.scc_iterations = iteration_count
+        result.scc_iterations = _iter
 
-        # Re-evaluate non-cyclic cells that depend on converged cycle cells
-        for cell_id in affected:
-            if cell_id in cyclic_cells:
-                continue
+        # 5b. Re-evaluate non-cyclic cells in topological order
+        for cell_id in non_cyclic_affected:
             cell = graph.cells.get(cell_id)
             if cell is None or not cell.formula_raw:
                 continue
             old_val = cell.value
             new_val = evaluate_cell(cell_id, graph)
-            if new_val is not None:
+            if new_val is not None and old_val != new_val:
                 cell.value = new_val
+                result.changed_cells.append(
+                    CellChange(cell_id, old_val, new_val, cell.formula_raw)
+                )
 
-        # Final pass: re-evaluate cyclic cells after non-cyclic deps resolved.
-        # Some cyclic cells depend on non-cyclic predecessors (e.g. N60=N58+N59
-        # where N58 is non-cyclic and only updated in step 6 above).
-        for cell_id in affected:
-            if cell_id not in cyclic_cells:
-                continue
-            cell = graph.cells.get(cell_id)
-            if cell is None or not cell.formula_raw:
-                continue
-            new_val = evaluate_cell(cell_id, graph)
-            if new_val is not None:
+        # 5c. Final SCC re-convergence after non-cyclic values settled
+        for _iter in range(1, max_iter + 1):
+            max_delta = 0.0
+            for cell_id in sorted_cyclic:
+                cell = graph.cells.get(cell_id)
+                if cell is None or not cell.formula_raw:
+                    continue
                 old_val = cell.value
+                new_val = evaluate_cell(cell_id, graph)
+                if new_val is None:
+                    continue
                 cell.value = new_val
-                if old_val != new_val:
-                    result.changed_cells.append(
-                        CellChange(cell_id, old_val, new_val, cell.formula_raw)
-                    )
+                try:
+                    delta = abs(float(new_val) - float(old_val))
+                except (TypeError, ValueError):
+                    delta = 1.0
+                max_delta = max(max_delta, delta)
+
+            if max_delta <= scc_tol:
+                break
 
     # 6. Sync Indicator layer for all changed cells
     _sync_indicators(graph, result.changed_cells)

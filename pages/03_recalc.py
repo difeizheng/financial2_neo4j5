@@ -297,7 +297,8 @@ with editor_col:
                 st.session_state[f"wg_{task.id}"] = working_graph
                 st.session_state[f"rr_{task.id}"] = result
                 st.session_state[f"auto_viz_{task.id}"] = True
-                st.toast(f"重算完成：{result.affected_count} 个变化，快照「{snap_name}」已保存（可与「{base_snap_name}」对比）", icon="✅")
+                iter_info = f"，SCC 迭代 {result.scc_iterations} 次" if result.scc_iterations else ""
+                st.toast(f"重算完成：{result.affected_count} 个变化{iter_info}，快照「{snap_name}」已保存（可与「{base_snap_name}」对比）", icon="✅")
                 st.rerun()
 
 # ── Right: Results panel ────────────────────────────────────────────────────
@@ -308,7 +309,7 @@ working_graph = st.session_state.get(f"wg_{task.id}")
 with results_col:
     st.subheader("📊 结果面板")
 
-    r_tabs = st.tabs(["关键指标", "影响链", "修改历史"])
+    r_tabs = st.tabs(["关键指标", "影响链", "修改历史", "重算设置"])
 
     # ── Tab 1: Key metrics ───────────────────────────────────────────────
     with r_tabs[0]:
@@ -472,3 +473,32 @@ with results_col:
                 st.rerun()
         else:
             st.info("暂无修改记录")
+
+    # ── Tab 4: Recalc settings ───────────────────────────────────────────
+    with r_tabs[3]:
+        st.caption("循环依赖迭代求值参数（Excel 模型中存在 F9→F10→F42→F38→F9 循环引用时生效）")
+
+        new_max_iter = st.number_input(
+            "最大迭代次数",
+            min_value=10,
+            max_value=500,
+            value=ws.recalc_max_iter,
+            step=10,
+            key="recalc_max_iter_input",
+        )
+        new_tol = st.number_input(
+            "收敛容差",
+            min_value=1e-15,
+            max_value=1e-3,
+            value=ws.recalc_tol,
+            format="%.0e",
+            key="recalc_tol_input",
+        )
+
+        if new_max_iter != ws.recalc_max_iter or new_tol != ws.recalc_tol:
+            ws.recalc_max_iter = new_max_iter
+            ws.recalc_tol = new_tol
+            save_workspace(ws)
+            st.toast(f"已更新：迭代={new_max_iter}, 容差={new_tol:.0e}", icon="⚙️")
+
+        st.caption(f"当前：迭代 {ws.recalc_max_iter} 次，容差 {ws.recalc_tol:.0e}")

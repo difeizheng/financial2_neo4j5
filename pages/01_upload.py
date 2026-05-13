@@ -25,6 +25,7 @@ from financial_kg.config import NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD, save_conf
 from financial_kg.viz.qa_chart import render_bar_chart_html, render_pie_chart_html
 from financial_kg.qa.quality_score import compute_quality_diagnostics, QualityDiagnostics
 from financial_kg.qa.stage_timer import StageTimer
+from financial_kg.engine.excel_export import export_parsed_excel
 
 st.set_page_config(layout="wide")
 
@@ -39,6 +40,33 @@ def _render_stage_timings(container, timings: list[dict]) -> None:
             timing_rows.append({"阶段": t["stage"], "耗时": f"{t['duration_s']:.1f}s", "占比": f"{t['pct']}%", "进度": bar})
         if timing_rows:
             st.dataframe(pd.DataFrame(timing_rows), use_container_width=True, hide_index=True, height=min(len(timing_rows) * 35 + 38, 200))
+
+
+def _export_parsed_excel_for_task(task) -> None:
+    """导出解析后的 Excel（公式单元格保留原样，Excel 自动重算）。"""
+    import tempfile
+    cells_path = os.path.join(task.output_dir, f"{task.id}_cells.json")
+    graph = load_graph(cells_path)
+    original_path = os.path.join(task.output_dir, f"{task.id}_original.xlsx")
+
+    if not os.path.exists(original_path):
+        st.error(f"未找到原始 Excel 副本：{original_path}")
+        return
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp_out:
+        export_path = tmp_out.name
+
+    with st.spinner(f"导出 {task.filename} ..."):
+        export_parsed_excel(original_path, graph.cells, export_path)
+
+    with open(export_path, "rb") as f:
+        st.download_button(
+            "⬇️ 下载完成",
+            data=f,
+            file_name=f"{task.filename.rsplit('.', 1)[0]}_parsed.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key=f"dl_file_{task.id}",
+        )
 
 
 def _build_table_dag_data(graph) -> dict:
@@ -659,6 +687,8 @@ if tasks:
                             os.path.join(t.output_dir, f"{t.id}_cells.json")
                         )
                         st.switch_page("pages/02_explorer.py")
+                    if st.button("📥", key=f"dl_{t.id}", help="下载解析后 Excel（公式单元格保留原样）"):
+                        _export_parsed_excel_for_task(t)
                 if st.button("🗑️", key=f"del_{t.id}", help=f"删除任务 {t.id}"):
                     st.session_state[_DEL_CONFIRM_KEY] = t.id
 

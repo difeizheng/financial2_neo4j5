@@ -66,6 +66,8 @@ class WorkspaceState:
     active_scenario: str = "基准"
     pending_edits: dict[str, Any] = field(default_factory=dict)
     last_recalc_result: dict | None = None
+    recalc_max_iter: int = 100
+    recalc_tol: float = 1e-9
 
 
 _WORKSPACES_DIR = Path(__file__).resolve().parent.parent.parent / "workspaces"
@@ -84,6 +86,8 @@ def load_workspace(task_id: str) -> WorkspaceState:
         ws.active_scenario = data.get("active_scenario", "基准")
         ws.pending_edits = data.get("pending_edits", {})
         ws.last_recalc_result = data.get("last_recalc_result")
+        ws.recalc_max_iter = data.get("recalc_max_iter", 100)
+        ws.recalc_tol = data.get("recalc_tol", 1e-9)
 
         for name, sdata in data.get("scenarios", {}).items():
             ws.scenarios[name] = Scenario(
@@ -120,6 +124,8 @@ def save_workspace(ws: WorkspaceState) -> None:
         "active_scenario": ws.active_scenario,
         "pending_edits": ws.pending_edits,
         "last_recalc_result": ws.last_recalc_result,
+        "recalc_max_iter": ws.recalc_max_iter,
+        "recalc_tol": ws.recalc_tol,
         "scenarios": {
             name: {
                 "id": s.id,
@@ -266,7 +272,7 @@ def apply_and_recalc(
 
     batch_id = str(uuid.uuid4())[:8]
 
-    result = recalculate(graph, updates)
+    result = recalculate(graph, updates, max_iter=ws.recalc_max_iter, tol=ws.recalc_tol)
 
     # Save overrides to scenario
     if scenario:

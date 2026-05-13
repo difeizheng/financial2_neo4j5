@@ -3,6 +3,16 @@
 The `formulas` library expects inputs keyed by raw Excel reference strings
 (e.g. 'F5', '$I$250', 'F5:BE5', '参数输入表!I250').  Our cell IDs use the
 format "{sheet}_{row}_{col}".  This module bridges the two representations.
+
+Performance notes
+-----------------
+- Compiled formula objects are cached **persistently** across recalculation
+  sessions (keyed by formula string).  Previously clear_formula_cache() wiped
+  this on every recalc call, forcing re-compilation of every formula each run.
+  Compilation is now ~10-50x more expensive than evaluation, so keeping the
+  cache warm is critical.
+- clear_formula_cache() is retained for tests / memory-pressure situations but
+  should NOT be called at the start of every recalculate() call.
 """
 from __future__ import annotations
 import re
@@ -27,37 +37,21 @@ _SHEET_NAME_ALIASES = {
     '表1-资金筹措及还本付息信息表': '表1-资金筹措及还本付息表',
 }
 
-# Per-graph cache: graph_id -> set of actual sheet names
-_sheet_cache: dict[int, set[str]] = {}
-
-
-def _get_sheet_names(graph: FinancialGraph) -> set[str]:
-    """Cached sheet name lookup. Invalidate via clear_sheet_cache()."""
-    gid = id(graph)
-    if gid not in _sheet_cache:
-        _sheet_cache[gid] = {
-            cid.rsplit('_', 2)[0]
-            for cid in graph.cells
-            if len(cid.rsplit('_', 2)) == 3
-        }
-    return _sheet_cache[gid]
-
-
-def clear_sheet_cache() -> None:
-    """Clear per-graph sheet name cache (call when graph changes)."""
-    _sheet_cache.clear()
-
 
 def _normalize_sheet_name(sheet: str, graph: FinancialGraph) -> str:
     """Resolve sheet name aliases to actual storage names."""
     if sheet in _SHEET_NAME_ALIASES:
         return _SHEET_NAME_ALIASES[sheet]
 
-    actual_sheets = _get_sheet_names(graph)
+    actual_sheets = set()
+    for cid in graph.cells.keys():
+        parts = cid.rsplit('_', 2)
+        if len(parts) == 3:
+            actual_sheets.add(parts[0])
+
     if sheet in actual_sheets:
         return sheet
 
-    # Prefix match for aliases
     for actual in actual_sheets:
         if sheet.split('-')[0] == actual.split('-')[0] if '-' in sheet else False:
             return actual
@@ -68,13 +62,6 @@ def _normalize_sheet_name(sheet: str, graph: FinancialGraph) -> str:
 # ── Reference key helpers ────────────────────────────────────────────────────
 
 def _cell_id_to_ref(cell_id: str, formula_sheet: str) -> str:
-    """Convert 'Sheet_row_col' → Excel reference key expected by formulas lib.
-
-    Same-sheet cells: 'col + row'  (e.g. 'I250')
-    Cross-sheet cells: 'Sheet!col+row' (e.g. '参数输入表!I250')
-    """
-    # cell_id format: "{sheet}_{row}_{col}"
-    # sheet names may contain underscores, so split from the right
     parts = cell_id.rsplit("_", 2)
     if len(parts) != 3:
         return cell_id
@@ -90,15 +77,9 @@ def _build_input_map(
     formula_sheet: str,
     graph: FinancialGraph,
 ) -> dict[str, np.ndarray]:
-    """Build the kwargs dict for a compiled formulas function.
-
-    func_inputs is the OrderedDict from func.inputs (raw Excel ref strings).
-    We look up each referenced cell's current value from the graph.
-    """
     kwargs: dict[str, np.ndarray] = {}
     for raw_key in func_inputs:
-        value = _resolve_input_key(raw_key, formula_sheet, graph)
-        kwargs[raw_key] = value
+        kwargs[raw_key] = _resolve_input_key(raw_key, formula_sheet, graph)
     return kwargs
 
 
@@ -107,12 +88,9 @@ def _resolve_input_key(
     formula_sheet: str,
     graph: FinancialGraph,
 ) -> np.ndarray:
-    """Resolve a single formulas input key to a numpy array."""
-    # Determine sheet and address
     if "!" in raw_key:
         sheet_part, addr_part = raw_key.split("!", 1)
         sheet_part = sheet_part.strip("'")
-        # Normalize sheet name (handle aliases)
         sheet_part = _normalize_sheet_name(sheet_part, graph)
     else:
         sheet_part = formula_sheet
@@ -120,11 +98,9 @@ def _resolve_input_key(
 
     addr_part = addr_part.replace("$", "")
 
-    # Range reference (e.g. F5:BE5)
     if ":" in addr_part:
         return _resolve_range(sheet_part, addr_part, graph)
 
-    # Single cell
     cell_id = _addr_to_cell_id(sheet_part, addr_part)
     cell = graph.cells.get(cell_id)
     val = cell.value if cell is not None else None
@@ -132,10 +108,7 @@ def _resolve_input_key(
 
 
 def _resolve_range(sheet: str, addr: str, graph: FinancialGraph) -> np.ndarray:
-    """Resolve a range like 'F5:BE5' to a 2-D numpy array."""
-    # Normalize sheet name
     sheet = _normalize_sheet_name(sheet, graph)
-
     start, end = addr.split(":", 1)
     start_col, start_row = _split_col_row(start)
     end_col, end_row = _split_col_row(end)
@@ -159,7 +132,6 @@ def _resolve_range(sheet: str, addr: str, graph: FinancialGraph) -> np.ndarray:
 
 
 def _split_col_row(addr: str):
-    """Split 'BE5' → ('BE', '5')."""
     m = re.match(r"([A-Za-z]+)(\d+)", addr)
     if not m:
         raise ValueError(f"Cannot parse cell address: {addr!r}")
@@ -171,38 +143,20 @@ def _addr_to_cell_id(sheet: str, addr: str) -> str:
     return f"{sheet}_{row}_{col}"
 
 
-# ── Coerce caching ────────────────────────────────────────────────────────────
-# Simple LRU-ish cache for value coercion (ISO dates are the expensive case)
-_coerce_cache: dict[Any, Any] = {}
-_COERCE_CACHE_MAX = 8192
-_COERCE_SENTINEL = object()
-
-
 def _coerce(val: Any) -> Any:
     """Convert Python value to something numpy/formulas can handle."""
-    # Fast path: check cache
-    cached = _coerce_cache.get(val, _COERCE_SENTINEL)
-    if cached is not _COERCE_SENTINEL:
-        return cached
-
     if val is None:
         return 0.0
 
-    # Handle error values (preserve for propagation)
     if isinstance(val, str) and val in ('#NUM!', '#VALUE!', '#DIV/0!', '#REF!', '#N/A'):
-        _coerce_cache[val] = val
         return val
 
-    # Handle ISO date strings (e.g., '2030-08-31T00:00:00')
     if isinstance(val, str) and 'T00:00:00' in val:
         try:
             dt = datetime.fromisoformat(val.replace('T00:00:00', ''))
             excel_epoch = datetime(1899, 12, 30)
             serial = (dt - excel_epoch).days
-            result = float(serial)
-            if len(_coerce_cache) < _COERCE_CACHE_MAX:
-                _coerce_cache[val] = result
-            return result
+            return float(serial)
         except Exception:
             pass
 
@@ -212,29 +166,31 @@ def _coerce(val: Any) -> Any:
         return float(val)
     if isinstance(val, str):
         return val
-    result = str(val)
-    return result
+    return str(val)
 
 
-# ── Main evaluation function ─────────────────────────────────────────────────
+# ── Formula compilation cache (persistent across recalc sessions) ─────────────
+#
+# KEY CHANGE from original: this cache is intentionally NOT cleared between
+# recalculate() calls.  Formulas don't change at runtime; there is no reason
+# to recompile them.  clear_formula_cache() is kept for explicit invalidation
+# (e.g. after loading a new workbook).
 
-# Cache compiled formula functions: formula_string -> compiled callable
 _compiled_cache: dict[str, Any] = {}
 
 
 def clear_formula_cache() -> None:
-    """Clear all evaluator caches (formula, sheet, coerce).
+    """Clear the compiled formula cache.
 
-    Only call when the graph structure changes. For normal recalculation
-    sessions on the same graph, the formula cache is preserved across calls.
+    Only call this when the workbook itself changes (new file loaded).
+    Do NOT call this at the start of every recalculate() — that defeats the
+    purpose of the cache and is the primary cause of the 11-hour runtime.
     """
     _compiled_cache.clear()
-    _sheet_cache.clear()
-    _coerce_cache.clear()
 
 
 def _compile_formula(formula: str):
-    """Parse and compile a formula, caching the result."""
+    """Parse and compile a formula, caching the result persistently."""
     if formula in _compiled_cache:
         return _compiled_cache[formula]
 
@@ -247,6 +203,7 @@ def _compile_formula(formula: str):
         _compiled_cache[formula] = func
         return func
     except Exception:
+        _compiled_cache[formula] = None  # cache failures too — don't retry
         return None
 
 
@@ -284,7 +241,6 @@ def _extract_scalar(result: Any) -> Any:
         val = flat[0]
         if isinstance(val, float) and np.isnan(val):
             return None
-        # Convert numpy types to Python natives
         if isinstance(val, (np.integer,)):
             return int(val)
         if isinstance(val, (np.floating,)):

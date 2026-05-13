@@ -13,3 +13,4 @@ output/*.json
 output/*.xlsx
 snapshots/*.json
 *.xlsx
+*.pptx

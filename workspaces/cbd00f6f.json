@@ -1,0 +1,17 @@
+{
+  "task_id": "cbd00f6f",
+  "active_scenario": "基准",
+  "pending_edits": {},
+  "last_recalc_result": null,
+  "scenarios": {
+    "基准": {
+      "id": "5aaa3372",
+      "task_id": "cbd00f6f",
+      "name": "基准",
+      "created_at": "2026-05-07T12:51:28.206224+00:00",
+      "overrides": {},
+      "recalc_result": null
+    }
+  },
+  "history": []
+}
