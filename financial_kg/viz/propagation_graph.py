@@ -15,6 +15,190 @@ _CAT_INDICATOR = 3
 _SYMBOL_SIZES = {_CAT_ROOT: 28, _CAT_CHANGED: 18, _CAT_DOWNSTREAM: 10, _CAT_INDICATOR: 22}
 
 
+def build_multi_propagation_data(
+    graph: FinancialGraph,
+    diff: SnapshotDiff,
+    root_cell_ids: list[str],
+    max_depth: int = 10,
+    max_nodes: int = 500,
+) -> dict:
+    """BFS from multiple roots through downstream dependents.
+
+    Each root gets a root_index for color differentiation.
+    """
+    if not root_cell_ids:
+        return _empty_propagation_data()
+
+    changed_set: set[str] = {c["id"] for c in diff.changed_cells}
+    old_new: dict[str, tuple] = {c["id"]: (c["old"], c["new"]) for c in diff.changed_cells}
+
+    # Assign root_index to each root
+    root_index_map: dict[str, int] = {cid: i for i, cid in enumerate(root_cell_ids)}
+
+    # Multi-source BFS: track (node, depth, source_root_index)
+    depth_map: dict[str, int] = {}
+    source_map: dict[str, int] = {}
+    queue: deque[tuple[str, int]] = deque()
+
+    for cid in root_cell_ids:
+        if cid not in depth_map:
+            depth_map[cid] = 0
+            source_map[cid] = root_index_map.get(cid, 0)
+            queue.append((cid, 0))
+
+    visited_cells: list[str] = list(root_cell_ids)
+    truncated = False
+
+    while queue:
+        node, current_depth = queue.popleft()
+        if current_depth >= max_depth:
+            continue
+        for pred in graph.cell_graph.predecessors(node):
+            if pred in depth_map:
+                continue
+            depth_map[pred] = current_depth + 1
+            source_map[pred] = source_map[node]  # inherit source from parent
+            visited_cells.append(pred)
+            queue.append((pred, current_depth + 1))
+            if len(visited_cells) >= max_nodes:
+                truncated = True
+                queue.clear()
+                break
+
+    # Build depth_levels
+    depth_levels: dict[int, list[str]] = {}
+    for cid in visited_cells:
+        d = depth_map[cid]
+        depth_levels.setdefault(d, []).append(cid)
+
+    # Collect indicator nodes
+    ind_depth: dict[str, int] = {}
+    for cid in visited_cells:
+        cell = graph.cells.get(cid)
+        if cell and cell.indicator_id:
+            iid = cell.indicator_id
+            ind_depth[iid] = min(ind_depth.get(iid, 9999), depth_map[cid])
+
+    # Build nodes
+    nodes: list[dict] = []
+    node_ids: set[str] = set()
+
+    for cid in visited_cells:
+        cell = graph.cells.get(cid)
+        is_root = cid in root_index_map
+        is_changed = cid in changed_set
+        if is_root:
+            cat = _CAT_ROOT
+        elif is_changed:
+            cat = _CAT_CHANGED
+        else:
+            cat = _CAT_DOWNSTREAM
+
+        old_v, new_v = old_new.get(cid, (None, None))
+        ind_name = None
+        if cell and cell.indicator_id:
+            ind = graph.indicators.get(cell.indicator_id)
+            ind_name = ind.name if ind else None
+
+        parts = cid.rsplit("_", 2)
+        label = parts[-1] if len(parts) >= 3 else cid
+
+        src_idx = source_map.get(cid, 0)
+        # Use source-based colors via symbolSize variation
+        nodes.append({
+            "id": cid,
+            "name": label,
+            "category": cat,
+            "depth": depth_map[cid],
+            "sheet": cell.sheet if cell else "",
+            "value_old": old_v,
+            "value_new": new_v,
+            "formula": cell.formula_raw if cell else None,
+            "indicator_name": ind_name,
+            "symbolSize": _SYMBOL_SIZES[cat] + (2 if src_idx % 3 == 0 else 0),
+            "source_index": src_idx,
+        })
+        node_ids.add(cid)
+
+    for iid, d in ind_depth.items():
+        ind = graph.indicators.get(iid)
+        if ind is None:
+            continue
+        nodes.append({
+            "id": iid,
+            "name": ind.name[:20] if ind.name else iid[-20:],
+            "category": _CAT_INDICATOR,
+            "depth": d,
+            "sheet": ind.sheet,
+            "value_old": None,
+            "value_new": None,
+            "formula": None,
+            "indicator_name": ind.name,
+            "symbolSize": _SYMBOL_SIZES[_CAT_INDICATOR],
+        })
+        node_ids.add(iid)
+        depth_levels.setdefault(d, []).append(iid)
+
+    # Build edges
+    edges: list[dict] = []
+    seen_edges: set[tuple] = set()
+    for cid in visited_cells:
+        for pred in graph.cell_graph.predecessors(cid):
+            if pred in node_ids:
+                key = (cid, pred)
+                if key not in seen_edges:
+                    seen_edges.add(key)
+                    edges.append({"source": cid, "target": pred})
+
+    for cid in visited_cells:
+        cell = graph.cells.get(cid)
+        if cell and cell.indicator_id and cell.indicator_id in node_ids:
+            key = (cid, cell.indicator_id)
+            if key not in seen_edges:
+                seen_edges.add(key)
+                edges.append({"source": cid, "target": cell.indicator_id})
+
+    categories = [
+        {"name": "起点", "itemStyle": {"color": "#EF5350"}},
+        {"name": "直接变化", "itemStyle": {"color": "#FFA726"}},
+        {"name": "下游传播", "itemStyle": {"color": "#78909C"}},
+        {"name": "指标", "itemStyle": {"color": "#42A5F5"}},
+    ]
+
+    return {
+        "nodes": nodes,
+        "edges": edges,
+        "categories": categories,
+        "depth_levels": {str(k): v for k, v in depth_levels.items()},
+        "max_depth": max(depth_map.values()) if depth_map else 0,
+        "root_ids": root_cell_ids,
+        "stats": {
+            "total_nodes": len(nodes),
+            "total_edges": len(edges),
+            "truncated": truncated,
+            "root_count": len(root_cell_ids),
+        },
+    }
+
+
+def _empty_propagation_data() -> dict:
+    """Return empty propagation data structure."""
+    return {
+        "nodes": [],
+        "edges": [],
+        "categories": [
+            {"name": "起点", "itemStyle": {"color": "#EF5350"}},
+            {"name": "直接变化", "itemStyle": {"color": "#FFA726"}},
+            {"name": "下游传播", "itemStyle": {"color": "#78909C"}},
+            {"name": "指标", "itemStyle": {"color": "#42A5F5"}},
+        ],
+        "depth_levels": {},
+        "max_depth": 0,
+        "root_id": "",
+        "stats": {"total_nodes": 0, "total_edges": 0, "truncated": False},
+    }
+
+
 def build_propagation_data(
     graph: FinancialGraph,
     diff: SnapshotDiff,

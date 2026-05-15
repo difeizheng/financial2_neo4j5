@@ -1,4 +1,4 @@
-"""Page 4: Snapshot comparison — enhanced with tabs, heatmap, export."""
+"""Page 4: Snapshot comparison — KPI dashboard, waterfall, multi-start propagation."""
 from __future__ import annotations
 
 import json
@@ -14,7 +14,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from financial_kg.storage.json_store import load_graph
 from financial_kg.storage.task_db import TaskDB
 from financial_kg.engine.snapshot import load_snapshot, diff_snapshots
-from financial_kg.viz.propagation_graph import build_propagation_data
+from financial_kg.engine.workspace import get_key_metrics
+from financial_kg.viz.propagation_graph import build_propagation_data, build_multi_propagation_data
 from financial_kg.viz.echarts_template import render_propagation_html
 from financial_kg.viz.compare_viz import (
     compute_change_summary,
@@ -24,8 +25,17 @@ from financial_kg.viz.compare_viz import (
     render_heatmap_html,
     export_diff_report_excel,
 )
+from financial_kg.viz.compare_charts import (
+    build_kpi_data,
+    render_kpi_dual_bar_html,
+    build_waterfall_data,
+    render_waterfall_html,
+    build_timeline_data,
+)
+from financial_kg.viz.qa_chart import render_time_series_html
 from financial_kg.engine.excel_export import export_modified_excel, find_original_excel
 
+st.set_page_config(layout="wide")
 st.title("快照对比")
 
 db = TaskDB()
@@ -36,78 +46,84 @@ if not tasks:
     st.stop()
 
 task_options = {f"{t.id} — {t.filename}": t for t in tasks}
-selected_label = st.selectbox("选择任务", list(task_options.keys()))
+selected_label = st.selectbox("选择任务", list(task_options.keys()), label_visibility="collapsed")
 task = task_options[selected_label]
+
 
 @st.cache_resource(show_spinner="加载图谱...")
 def _load(task_id: str, output_dir: str):
     cells_path = os.path.join(output_dir, f"{task_id}_cells.json")
     return load_graph(cells_path)
 
-graph = _load(task.id, task.output_dir)
 
-# ── Quick compare latest two ──────────────────────────────────────────────────
+graph = _load(task.id, task.output_dir)
 snaps = db.list_snapshots(task.id)
 
 if "locked_baseline" not in st.session_state:
     st.session_state["locked_baseline"] = None
-
 if "locked_baseline_task" not in st.session_state:
     st.session_state["locked_baseline_task"] = None
 
-# If task changed and baseline was locked to a different task, reset lock
+# Reset lock if task changed
 if st.session_state["locked_baseline_task"] != task.id:
     st.session_state["locked_baseline"] = None
     st.session_state["locked_baseline_task"] = None
 
-if snaps:
-    if st.button("对比最新两个快照", use_container_width=False):
-        if len(snaps) >= 2:
-            sorted_snaps = sorted(snaps, key=lambda s: s.created_at, reverse=True)
-            label_a = f"{sorted_snaps[0].name} ({sorted_snaps[0].created_at[:19]})"
-            label_b = f"{sorted_snaps[1].name} ({sorted_snaps[1].created_at[:19]})"
-            st.session_state["_auto_label_a"] = label_a
-            st.session_state["_auto_label_b"] = label_b
-            st.session_state["_run_auto_diff"] = True
-        else:
-            st.info("至少需要 2 个快照")
+# ── Snapshot selector (compact single-row layout) ────────────────────────────
 
-# ── Snapshot Selection ────────────────────────────────────────────────────────
 if len(snaps) < 2:
-    st.info("该任务快照不足 2 个，请先在「参数重算」页面创建快照。")
+    st.info("该任务快照不足 2 个，请在「参数重算」页面创建快照。")
     st.stop()
 
 snap_options = {f"{s.name} ({s.created_at[:19]})": s for s in snaps}
-default_a = snaps[-1]  # latest
-default_b = snaps[0]   # oldest
+sorted_snaps = sorted(snaps, key=lambda s: s.created_at, reverse=True)
+latest_label = f"{sorted_snaps[0].name} ({sorted_snaps[0].created_at[:19]})"
+second_label = f"{sorted_snaps[1].name} ({sorted_snaps[1].created_at[:19]})" if len(sorted_snaps) >= 2 else latest_label
 
-col_lock, col_a, col_swap, col_b = st.columns([1, 5, 1, 5])
+sel_row = st.columns([3, 1, 3, 1, 2, 2])
 
-with col_lock:
-    lock_baseline = st.checkbox("🔒 锁定基准", key="lock_cb")
+with sel_row[0]:
+    if st.session_state["locked_baseline"]:
+        label_a = st.selectbox("基准快照", [st.session_state["locked_baseline"]])
+    else:
+        default_idx = len(snaps) - 1
+        label_a = st.selectbox("基准快照", list(snap_options.keys()), index=default_idx)
 
-# Initialize locked baseline
-if lock_baseline and st.session_state["locked_baseline"] is None:
-    st.session_state["locked_baseline"] = f"{default_a.name} ({default_a.created_at[:19]})"
+with sel_row[1]:
+    st.write("")
+    st.write("")
+    if st.button("⇄", help="交换 A/B", use_container_width=True):
+        st.session_state["_swap"] = True
+
+with sel_row[2]:
+    label_b = st.selectbox("对比快照", list(snap_options.keys()), index=0)
+
+with sel_row[3]:
+    lock_cb = st.checkbox("🔒 锁定", key="lock_cb", help="锁定基准快照")
+
+if lock_cb and st.session_state["locked_baseline"] is None:
+    st.session_state["locked_baseline"] = label_a
     st.session_state["locked_baseline_task"] = task.id
-elif not lock_baseline:
+elif not lock_cb:
     st.session_state["locked_baseline"] = None
     st.session_state["locked_baseline_task"] = None
 
-with col_a:
-    if st.session_state["locked_baseline"]:
-        label_a = st.selectbox("快照 A（基准，已锁定）", [st.session_state["locked_baseline"]])
-    else:
-        label_a = st.selectbox("快照 A（基准）", list(snap_options.keys()), index=len(snaps) - 1)
+with sel_row[4]:
+    if st.button("对比最新两个", use_container_width=True):
+        st.session_state["_auto_a"] = latest_label
+        st.session_state["_auto_b"] = second_label
+        st.session_state["_run_auto_diff"] = True
 
-with col_swap:
-    st.write("")
-    st.write("")
-    if st.button("⇄", help="交换 A/B"):
-        st.session_state["_swap"] = True
-
-with col_b:
-    label_b = st.selectbox("快照 B（对比）", list(snap_options.keys()), index=0)
+with sel_row[5]:
+    if st.button("执行对比 ▶", type="primary", use_container_width=True):
+        rec_a = snap_options[label_a]
+        rec_b = snap_options[label_b]
+        if rec_a.id == rec_b.id:
+            st.warning("请选择两个不同的快照")
+        else:
+            st.session_state["_manual_a"] = label_a
+            st.session_state["_manual_b"] = label_b
+            st.session_state["_run_manual_diff"] = True
 
 # Handle swap
 if st.session_state.pop("_swap", False):
@@ -116,74 +132,135 @@ if st.session_state.pop("_swap", False):
     st.session_state["_run_swap_diff"] = True
 
 # ── Execute diff ──────────────────────────────────────────────────────────────
-if st.button("执行对比", type="primary"):
-    rec_a = snap_options[label_a]
-    rec_b = snap_options[label_b]
 
+def _do_diff(a_label: str, b_label: str):
+    if a_label not in snap_options or b_label not in snap_options:
+        return
+    rec_a = snap_options[a_label]
+    rec_b = snap_options[b_label]
     if rec_a.id == rec_b.id:
         st.warning("请选择两个不同的快照")
-        st.stop()
-
+        return
     with st.spinner("对比中..."):
         snap_a = load_snapshot(rec_a.filepath)
         snap_b = load_snapshot(rec_b.filepath)
         diff = diff_snapshots(snap_a, snap_b, graph)
-
     st.session_state["diff"] = diff
     st.session_state["diff_task_id"] = task.id
     st.session_state["snap_b_values"] = snap_b.values
     st.session_state.pop("prop_html", None)
 
-# Auto diff triggered by "latest two" button
-if st.session_state.pop("_run_auto_diff", False):
-    auto_a = st.session_state.pop("_auto_label_a", "")
-    auto_b = st.session_state.pop("_auto_label_b", "")
-    if auto_a and auto_b and auto_a in snap_options and auto_b in snap_options:
-        rec_a = snap_options[auto_a]
-        rec_b = snap_options[auto_b]
-        with st.spinner("对比中..."):
-            snap_a = load_snapshot(rec_a.filepath)
-            snap_b = load_snapshot(rec_b.filepath)
-            diff = diff_snapshots(snap_a, snap_b, graph)
-        st.session_state["diff"] = diff
-        st.session_state["diff_task_id"] = task.id
-        st.session_state["snap_b_values"] = snap_b.values
-        st.session_state.pop("prop_html", None)
 
-# Swap diff
+if st.session_state.pop("_run_auto_diff", False):
+    _do_diff(st.session_state.pop("_auto_a", ""), st.session_state.pop("_auto_b", ""))
+
+if st.session_state.pop("_run_manual_diff", False):
+    _do_diff(st.session_state.pop("_manual_a", ""), st.session_state.pop("_manual_b", ""))
+
 if st.session_state.pop("_run_swap_diff", False):
-    sw_a = st.session_state.pop("_swapped_a", "")
-    sw_b = st.session_state.pop("_swapped_b", "")
-    if sw_a and sw_b and sw_a in snap_options and sw_b in snap_options:
-        rec_a = snap_options[sw_a]
-        rec_b = snap_options[sw_b]
-        with st.spinner("对比中..."):
-            snap_a = load_snapshot(rec_a.filepath)
-            snap_b = load_snapshot(rec_b.filepath)
-            diff = diff_snapshots(snap_a, snap_b, graph)
-        st.session_state["diff"] = diff
-        st.session_state["diff_task_id"] = task.id
-        st.session_state["snap_b_values"] = snap_b.values
-        st.session_state.pop("prop_html", None)
+    _do_diff(st.session_state.pop("_swapped_a", ""), st.session_state.pop("_swapped_b", ""))
 
 # ── Show diff results ─────────────────────────────────────────────────────────
+
 diff = st.session_state.get("diff")
 if diff is None or st.session_state.get("diff_task_id") != task.id:
     st.stop()
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
-tab_summary, tab_heatmap, tab_cells, tab_prop, tab_export = st.tabs([
-    "汇总分析",
+
+tab_kpi, tab_impact, tab_heatmap, tab_prop, tab_export = st.tabs([
+    "关键指标",
+    "影响分析",
     "热力图",
-    "变化明细",
     "传播图",
     "导出",
 ])
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Tab 1: 汇总分析
+# Tab 1: 关键指标
 # ══════════════════════════════════════════════════════════════════════════════
-with tab_summary:
+with tab_kpi:
+    # KPI cards
+    kpi_data = build_kpi_data(diff, graph)
+
+    if kpi_data:
+        n_show = min(len(kpi_data), 9)
+        for ri in range((n_show + 2) // 3):
+            mc = st.columns(3)
+            for j, kpi in enumerate(kpi_data[ri * 3:(ri + 1) * 3]):
+                delta_str = None
+                if kpi["delta"] is not None:
+                    delta_str = f"{kpi['delta']:+,.2f}"
+                    if kpi["delta_pct"] is not None:
+                        delta_str += f" ({kpi['delta_pct']:+.1f}%)"
+
+                va_display = "—"
+                vb_display = "—"
+                if kpi["value_a"] is not None:
+                    try:
+                        va_display = f"{float(kpi['value_a']):,.2f}"
+                    except (ValueError, TypeError):
+                        va_display = str(kpi["value_a"])
+                if kpi["value_b"] is not None:
+                    try:
+                        vb_display = f"{float(kpi['value_b']):,.2f}"
+                    except (ValueError, TypeError):
+                        vb_display = str(kpi["value_b"])
+
+                with mc[j]:
+                    st.metric(
+                        label=kpi["name"],
+                        value=f"A: {va_display} → B: {vb_display}",
+                        delta=delta_str,
+                        delta_color="inverse" if kpi.get("delta") is not None and kpi["delta"] < 0 else "normal",
+                    )
+
+        if len(kpi_data) > 9:
+            with st.expander(f"查看全部 {len(kpi_data)} 个关键指标"):
+                for kpi in kpi_data[9:]:
+                    delta_str = ""
+                    if kpi["delta"] is not None:
+                        delta_str = f"Δ {kpi['delta']:+,.2f}"
+                        if kpi["delta_pct"] is not None:
+                            delta_str += f" ({kpi['delta_pct']:+.1f}%)"
+                    st.caption(f"{kpi['name']}: A={kpi['value_a']} → B={kpi['value_b']}  {delta_str}")
+
+        # A/B dual-bar chart
+        st.divider()
+        chart_html = render_kpi_dual_bar_html(
+            kpi_data,
+            snap_a_name=diff.snapshot_a,
+            snap_b_name=diff.snapshot_b,
+        )
+        components.html(chart_html, height=420, scrolling=False)
+
+    else:
+        st.info("未找到匹配的关键指标（NPV / IRR / 收入 / 成本等）")
+
+    # Multi-snapshot timeline (≥3 snapshots)
+    if len(snaps) >= 3:
+        st.divider()
+        st.subheader("多快照趋势")
+        with st.spinner("加载多快照数据..."):
+            timeline_data = build_timeline_data(snaps, graph)
+
+        if timeline_data:
+            html = render_time_series_html(
+                series_data=timeline_data[:8],
+                title="关键指标跨快照变化",
+                height="380px",
+            )
+            components.html(html, height=380, scrolling=False)
+            if len(timeline_data) > 8:
+                st.caption(f"显示前 {min(8, len(timeline_data))} 个指标，共 {len(timeline_data)} 个")
+        else:
+            st.info("无法从历史快照中提取指标值（快照值结构可能不同）")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Tab 2: 影响分析
+# ══════════════════════════════════════════════════════════════════════════════
+with tab_impact:
+    # Summary metrics
     c1, c2, c3 = st.columns(3)
     c1.metric("变化单元格数", diff.summary["total_changed_cells"])
     c2.metric("受影响 Indicator 数", diff.summary["total_changed_indicators"])
@@ -192,6 +269,7 @@ with tab_summary:
     if diff.summary["sheets_affected"]:
         st.write("涉及 Sheet：", "、".join(diff.summary["sheets_affected"]))
 
+    # Change summary
     if diff.changed_cells:
         summary = compute_change_summary(diff, graph)
 
@@ -202,29 +280,32 @@ with tab_summary:
         r3.metric("最大变化单元格", summary["max_magnitude_cell"][:30])
         r4.metric("最大变化幅度", f"{summary['max_magnitude']:,.2f}")
 
-        st.subheader("影响分布")
-        ic1, ic2 = st.columns(2)
-        ic1.metric("关键单元格", summary["critical_count"])
-        ic2.metric("普通单元格", summary["normal_count"])
+        # Waterfall chart
+        st.subheader("变化贡献瀑布图")
+        wf_data = build_waterfall_data(diff, graph)
+        wf_html = render_waterfall_html(wf_data, title=f"净变化: {wf_data['net_change']:+,.2f}")
+        components.html(wf_html, height=420, scrolling=False)
 
+        # Sheet ranking
         if summary["sheets_ranking"]:
             st.subheader("Sheet 变更排行")
             sheet_rows = [{"Sheet": s, "变化数": c} for s, c in summary["sheets_ranking"]]
             st.bar_chart(sheet_rows, x="Sheet", y="变化数", horizontal=True)
 
+        # Top indicators
         if summary["top_indicators"]:
             st.subheader("Top 10 受影响 Indicator")
             ind_rows = [{"Indicator": n, "变化单元格数": c} for n, c in summary["top_indicators"]]
             st.bar_chart(ind_rows, x="Indicator", y="变化单元格数", horizontal=True)
 
-        # Indicator chart
+        # Indicator change chart
         if st.button("查看指标变化图表", key="show_ind_chart"):
             chart_data = build_indicator_change_chart(diff, graph)
             html = render_indicator_chart_html(chart_data)
             components.html(html, height=520, scrolling=False)
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Tab 2: 热力图
+# Tab 3: 热力图
 # ══════════════════════════════════════════════════════════════════════════════
 with tab_heatmap:
     view_mode = st.radio("视图模式", ["指标聚合图", "单元格热力图"], horizontal=True)
@@ -246,80 +327,57 @@ with tab_heatmap:
             components.html(html, height=620, scrolling=False)
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Tab 3: 变化明细
-# ══════════════════════════════════════════════════════════════════════════════
-with tab_cells:
-    all_sheets = sorted({c.get("sheet", "") for c in diff.changed_cells if c.get("sheet")})
-
-    st.caption(f"共 {len(diff.changed_cells)} 条变化")
-
-    col_f1, col_f2 = st.columns(2)
-    with col_f1:
-        selected_sheets = st.multiselect("按 Sheet 筛选", all_sheets, default=[])
-    with col_f2:
-        search_kw = st.text_input("搜索", placeholder="Cell ID / Sheet / Indicator / 值")
-
-    filtered = diff.changed_cells
-    if selected_sheets:
-        filtered = [c for c in filtered if c.get("sheet") in selected_sheets]
-    if search_kw:
-        kw = search_kw.lower()
-        filtered = [
-            c for c in filtered
-            if kw in c["id"].lower()
-            or kw in c.get("sheet", "").lower()
-            or kw in c.get("indicator_name", "").lower()
-            or kw in str(c.get("old", "")).lower()
-            or kw in str(c.get("new", "")).lower()
-        ]
-
-    if not filtered:
-        st.info("无匹配的变化单元格")
-    else:
-        rows = [
-            {
-                "Cell ID": c["id"],
-                "Sheet": c.get("sheet", ""),
-                "旧值": c.get("old"),
-                "新值": c.get("new"),
-                "变化量": c.get("change_magnitude", 0),
-                "方向": "↑ 增加" if c.get("direction") == "increase" else "↓ 减少",
-                "公式": c.get("formula") or "",
-                "Indicator": c.get("indicator_name", ""),
-            }
-            for c in filtered
-        ]
-        st.dataframe(rows, use_container_width=True, height=500)
-        if search_kw or selected_sheets:
-            st.caption(f"筛选结果：{len(rows)} / {len(diff.changed_cells)} 条")
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Tab 4: 传播图 (保留现有功能)
+# Tab 4: 传播图 (enhanced: multi-start)
 # ══════════════════════════════════════════════════════════════════════════════
 with tab_prop:
-    cell_search = st.text_input("搜索传播起点", placeholder="输入 Cell ID、Sheet 名或值...")
-    if cell_search:
-        kw = cell_search.lower()
-        candidates = [
-            c for c in diff.changed_cells
-            if kw in c["id"].lower()
-            or kw in c.get("sheet", "").lower()
-            or kw in str(c.get("old", "")).lower()
-            or kw in str(c.get("new", "")).lower()
-        ]
-    else:
-        candidates = diff.changed_cells
+    # Mode selector
+    prop_mode = st.radio(
+        "传播模式",
+        ["单起点", "全选变更", "按 Sheet 筛选"],
+        horizontal=True,
+    )
 
-    cell_options = {
-        f"{c['id']}  ({c['sheet']})  {c['old']} → {c['new']}": c["id"]
-        for c in candidates[:500]
-    }
-    if not cell_options:
-        st.warning("无匹配的变化单元格，请调整搜索条件")
+    if prop_mode == "单起点":
+        cell_search = st.text_input("搜索传播起点", placeholder="输入 Cell ID、Sheet 名或值...")
+        if cell_search:
+            kw = cell_search.lower()
+            candidates = [
+                c for c in diff.changed_cells
+                if kw in c["id"].lower()
+                or kw in c.get("sheet", "").lower()
+                or kw in str(c.get("old", "")).lower()
+                or kw in str(c.get("new", "")).lower()
+            ]
+        else:
+            candidates = diff.changed_cells
+
+        cell_options = {
+            f"{c['id']}  ({c['sheet']})  {c['old']} → {c['new']}": c["id"]
+            for c in candidates[:500]
+        }
+        if cell_options:
+            root_label = st.selectbox("选择传播起点", list(cell_options.keys()))
+            root_ids = [cell_options[root_label]]
+        else:
+            root_ids = []
+            st.warning("无匹配的变化单元格")
+
+    elif prop_mode == "全选变更":
+        root_ids = [c["id"] for c in diff.changed_cells[:2000]]
+        st.success(f"全选 {len(root_ids)} 个变更单元格作为传播起点")
+
+    else:  # 按 Sheet 筛选
+        sheets = sorted({c.get("sheet", "") for c in diff.changed_cells if c.get("sheet")})
+        selected_sheets = st.multiselect("选择 Sheet", sheets)
+        if selected_sheets:
+            root_ids = [c["id"] for c in diff.changed_cells if c.get("sheet") in selected_sheets][:1000]
+            st.success(f"{len(root_ids)} 个变更单元格作为传播起点")
+        else:
+            root_ids = []
+
+    if not root_ids:
+        st.info("请选择传播起点")
         st.stop()
-    root_id = cell_options[st.selectbox("选择传播起点", list(cell_options.keys()))]
-    if cell_search and len(candidates) > 500:
-        st.caption(f"匹配 {len(candidates)} 个，显示前 500 个")
 
     col_d, col_s = st.columns(2)
     max_depth = col_d.slider("最大传播深度", 1, 15, 8)
@@ -327,7 +385,10 @@ with tab_prop:
 
     if st.button("生成传播图"):
         with st.spinner("构建传播图..."):
-            data = build_propagation_data(graph, diff, root_id, max_depth, max_nodes)
+            if len(root_ids) == 1:
+                data = build_propagation_data(graph, diff, root_ids[0], max_depth, max_nodes)
+            else:
+                data = build_multi_propagation_data(graph, diff, root_ids, max_depth, max_nodes)
             html = render_propagation_html(
                 json.dumps(data, ensure_ascii=False, default=str)
             )
@@ -344,7 +405,6 @@ with tab_prop:
 # Tab 5: 导出
 # ══════════════════════════════════════════════════════════════════════════════
 with tab_export:
-    # ── 文件来源 ─────────────────────────────────────────────────────
     original_path = find_original_excel(task.id, task.output_dir)
     has_original = original_path is not None
 
@@ -359,7 +419,6 @@ with tab_export:
 
     can_export = has_original or uploaded_original
 
-    # 预计算公式单元格集合
     formula_ids = {cid for cid, cell in graph.cells.items() if cell.formula_raw}
 
     st.subheader("导出修改后 Excel")
