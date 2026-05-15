@@ -168,9 +168,10 @@ if diff is None or st.session_state.get("diff_task_id") != task.id:
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
 
-tab_kpi, tab_impact, tab_heatmap, tab_prop, tab_export = st.tabs([
+tab_kpi, tab_impact, tab_cells, tab_heatmap, tab_prop, tab_export = st.tabs([
     "关键指标",
     "影响分析",
+    "变化明细",
     "热力图",
     "传播图",
     "导出",
@@ -305,7 +306,55 @@ with tab_impact:
             components.html(html, height=520, scrolling=False)
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Tab 3: 热力图
+# Tab 3: 变化明细
+# ══════════════════════════════════════════════════════════════════════════════
+with tab_cells:
+    all_sheets = sorted({c.get("sheet", "") for c in diff.changed_cells if c.get("sheet")})
+
+    st.caption(f"共 {len(diff.changed_cells)} 条变化")
+
+    col_f1, col_f2 = st.columns(2)
+    with col_f1:
+        selected_sheets = st.multiselect("按 Sheet 筛选", all_sheets, default=[], key="cm_sheets")
+    with col_f2:
+        search_kw = st.text_input("搜索", placeholder="Cell ID / Sheet / Indicator / 值", key="cm_search")
+
+    filtered = diff.changed_cells
+    if selected_sheets:
+        filtered = [c for c in filtered if c.get("sheet") in selected_sheets]
+    if search_kw:
+        kw = search_kw.lower()
+        filtered = [
+            c for c in filtered
+            if kw in c["id"].lower()
+            or kw in c.get("sheet", "").lower()
+            or kw in c.get("indicator_name", "").lower()
+            or kw in str(c.get("old", "")).lower()
+            or kw in str(c.get("new", "")).lower()
+        ]
+
+    if not filtered:
+        st.info("无匹配的变化单元格")
+    else:
+        rows = [
+            {
+                "Cell ID": c["id"],
+                "Sheet": c.get("sheet", ""),
+                "旧值": c.get("old"),
+                "新值": c.get("new"),
+                "变化量": c.get("change_magnitude", 0),
+                "方向": "↑ 增加" if c.get("direction") == "increase" else "↓ 减少",
+                "公式": c.get("formula") or "",
+                "Indicator": c.get("indicator_name", ""),
+            }
+            for c in filtered
+        ]
+        st.dataframe(rows, use_container_width=True, height=500)
+        if search_kw or selected_sheets:
+            st.caption(f"筛选结果：{len(rows)} / {len(diff.changed_cells)} 条")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Tab 4: 热力图
 # ══════════════════════════════════════════════════════════════════════════════
 with tab_heatmap:
     view_mode = st.radio("视图模式", ["指标聚合图", "单元格热力图"], horizontal=True)
@@ -327,7 +376,7 @@ with tab_heatmap:
             components.html(html, height=620, scrolling=False)
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Tab 4: 传播图 (enhanced: multi-start)
+# Tab 5: 传播图 (enhanced: multi-start)
 # ══════════════════════════════════════════════════════════════════════════════
 with tab_prop:
     # Mode selector
@@ -402,7 +451,7 @@ with tab_prop:
         components.html(st.session_state["prop_html"], height=780, scrolling=False)
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Tab 5: 导出
+# Tab 6: 导出
 # ══════════════════════════════════════════════════════════════════════════════
 with tab_export:
     original_path = find_original_excel(task.id, task.output_dir)
