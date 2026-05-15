@@ -103,6 +103,96 @@ if len(ws.scenarios) > 1:
             else:
                 st.toast("不能删除基准", icon="⚠️")
 
+# Scenario management: clone, compare, export
+if len(ws.scenarios) > 1:
+    mgr_cols = st.columns([2, 2, 2, 2])
+    with mgr_cols[0]:
+        clone_target = st.selectbox("克隆场景", scenario_names, key="clone_from")
+    with mgr_cols[1]:
+        if st.button("📋 克隆为新场景", use_container_width=True, key="do_clone"):
+            src = ws.scenarios[clone_target]
+            new_sname = f"{src.name}_副本"
+            counter = 1
+            while new_sname in ws.scenarios:
+                counter += 1
+                new_sname = f"{src.name}_副本{counter}"
+            ws.scenarios[new_sname] = Scenario(
+                id=str(uuid.uuid4())[:8],
+                task_id=task.id,
+                name=new_sname,
+                created_at=datetime.now(timezone.utc).isoformat(),
+                overrides=dict(src.overrides),
+            )
+            ws.active_scenario = new_sname
+            save_workspace(ws)
+            st.toast(f"已克隆「{clone_target}」→「{new_sname}」", icon="📋")
+            st.rerun()
+    with mgr_cols[2]:
+        if st.button("📊 场景对比", use_container_width=True, key="do_compare"):
+            st.session_state["show_compare"] = not st.session_state.get("show_compare", False)
+            st.rerun()
+    with mgr_cols[3]:
+        if st.button("📤 导出场景", use_container_width=True, key="do_export"):
+            export_data = {
+                name: {
+                    "name": s.name,
+                    "created_at": s.created_at,
+                    "overrides": s.overrides,
+                }
+                for name, s in ws.scenarios.items()
+            }
+            export_json = json.dumps(export_data, ensure_ascii=False, indent=2)
+            st.download_button(
+                label="下载 JSON",
+                data=export_json,
+                file_name=f"scenarios_{task.id}.json",
+                mime="application/json",
+                use_container_width=True,
+            )
+
+# Scenario comparison modal
+if st.session_state.get("show_compare", False):
+    st.divider()
+    st.subheader("📊 场景对比")
+    compare_cols = st.columns(3)
+    with compare_cols[0]:
+        sel_a = st.selectbox("场景 A", scenario_names, key="cmp_a")
+    with compare_cols[1]:
+        sel_b = st.selectbox("场景 B", scenario_names, key="cmp_b")
+    with compare_cols[2]:
+        if st.button("关闭对比", key="close_compare"):
+            st.session_state["show_compare"] = False
+            st.rerun()
+
+    if sel_a != sel_b:
+        sa = ws.scenarios[sel_a]
+        sb = ws.scenarios[sel_b]
+        all_keys = set(sa.overrides.keys()) | set(sb.overrides.keys())
+        diff_keys = {k for k in all_keys if sa.overrides.get(k) != sb.overrides.get(k)}
+
+        if diff_keys:
+            diff_rows = []
+            for k in sorted(diff_keys):
+                va = sa.overrides.get(k, "—")
+                vb = sb.overrides.get(k, "—")
+                try:
+                    delta = float(vb) - float(va) if va != "—" and vb != "—" else None
+                    delta_pct = (delta / abs(float(va)) * 100) if delta is not None and va != 0 else None
+                except (ValueError, TypeError):
+                    delta = None
+                    delta_pct = None
+                diff_rows.append({
+                    "Cell ID": k,
+                    sel_a: va,
+                    sel_b: vb,
+                    "差值": f"{delta:+.4f}" if delta is not None else "—",
+                    "差值%": f"{delta_pct:+.2f}%" if delta_pct is not None else "—",
+                })
+            st.dataframe(diff_rows, use_container_width=True, hide_index=True, height=min(len(diff_rows) * 35 + 40, 400))
+            st.caption(f"{len(diff_keys)} 个参数不同")
+        else:
+            st.info("两个场景的参数完全一致")
+
 st.divider()
 
 # ── Main two-column layout ──────────────────────────────────────────────────
@@ -110,6 +200,11 @@ st.divider()
 editor_col, results_col = st.columns([3, 2])
 
 # ── Shared data ──────────────────────────────────────────────────────────────
+
+# Shared graph reference (single load via cache_resource)
+base_graph = _load_base(task.id, task.output_dir)
+ws: WorkspaceState = load_workspace(task.id)
+
 
 def _build_param_cells(graph):
     rows = []
@@ -134,12 +229,18 @@ def _build_param_cells(graph):
         })
     return rows
 
+
 @st.cache_data(show_spinner="构建参数列表...")
-def _cached_param_cells(task_id: str, output_dir: str):
+def _cached_param_cells_from_file(task_id: str, output_dir: str, file_mtime: float):
+    """Cache keyed on file mtime — invalidates when graph is updated by recalculation."""
     g = load_graph(os.path.join(output_dir, f"{task_id}_cells.json"))
     return _build_param_cells(g)
 
-all_param_cells = _cached_param_cells(task.id, task.output_dir)
+
+# Param cells with mtime-based cache invalidation
+_cells_path = os.path.join(task.output_dir, f"{task.id}_cells.json")
+_cells_mtime = os.path.getmtime(_cells_path) if os.path.exists(_cells_path) else 0.0
+all_param_cells = _cached_param_cells_from_file(task.id, task.output_dir, _cells_mtime)
 all_sheets = sorted(set(r["Sheet"] for r in all_param_cells if r["Sheet"]))
 cell_lookup = {r["Cell ID"]: r for r in all_param_cells}
 
@@ -246,19 +347,23 @@ with editor_col:
         st.session_state[pending_key] = global_pending
         ws.pending_edits = global_pending
 
-        # Status metrics
-        st.metric("已修改", len(global_pending))
+        # Status bar: show pending edit count + active scenario
+        status_cols = st.columns([1, 3, 2])
+        with status_cols[0]:
+            st.metric("待应用", len(global_pending))
+        with status_cols[1]:
+            st.caption(f"当前场景：「{ws.active_scenario}」— {len(scenario.overrides) if scenario else 0} 个已保存覆盖值")
 
-        # Action buttons
-        act_a, act_b, act_c = st.columns([1, 1, 2])
-        with act_a:
+        # Action buttons — combined save + recalc flow
+        act_row = st.columns([1, 1, 1, 2])
+        with act_row[0]:
             if st.button("清空修改", use_container_width=True):
                 st.session_state[pending_key] = {}
                 ws.pending_edits = {}
                 save_workspace(ws)
                 st.rerun()
-        with act_b:
-            if st.button("保存到场景", use_container_width=True):
+        with act_row[1]:
+            if st.button("仅保存场景", use_container_width=True):
                 if scenario and global_pending:
                     scenario.overrides.update(global_pending)
                     st.session_state[pending_key] = {}
@@ -266,14 +371,19 @@ with editor_col:
                     save_workspace(ws)
                     st.toast(f"已保存 {len(global_pending)} 个修改到「{ws.active_scenario}」", icon="💾")
                     st.rerun()
-        with act_c:
-            apply_clicked = st.button("🔄 应用并重算", type="primary", use_container_width=True)
-
-        if apply_clicked:
-            if not global_pending and not (scenario and scenario.overrides):
-                st.toast("暂无修改可应用", icon="ℹ️")
-            else:
+                elif not global_pending:
+                    st.toast("无待保存的修改", icon="ℹ️")
+        with act_row[2]:
+            if st.button("💾 保存并重算", type="primary", use_container_width=True):
+                # Save pending to scenario overrides, then recalc
                 working_graph = copy.deepcopy(base_graph)
+
+                # Persist pending → scenario overrides before recalc
+                if scenario and global_pending:
+                    scenario.overrides.update(global_pending)
+                    saved_count = len(global_pending)
+                else:
+                    saved_count = 0
 
                 # Ensure a "before" snapshot exists for comparison
                 base_snap_key = f"base_snap_{task.id}_{ws.active_scenario}"
@@ -283,9 +393,10 @@ with editor_col:
                     base_snap = create_snapshot(base_graph, task.id, base_snap_name)
                     db.save_snapshot(str(uuid.uuid4())[:8], task.id, base_snap_name, base_snap.filepath)
                     st.session_state[base_snap_key] = base_snap_name
-                    st.toast(f"已保存基准快照「{base_snap_name}」", icon="📸")
 
                 with st.spinner("重算中..."):
+                    ws.pending_edits = {}  # clear pending, overrides now in scenario
+                    st.session_state[pending_key] = {}
                     result = apply_and_recalc(working_graph, ws, base_graph)
 
                 # Create "after" snapshot for comparison page
@@ -293,6 +404,38 @@ with editor_col:
                 snap_name = f"{ws.active_scenario}_{_dt.now().strftime('%Y%m%d_%H%M%S')}"
                 snap = create_snapshot(working_graph, task.id, snap_name)
                 db.save_snapshot(str(uuid.uuid4())[:8], task.id, snap_name, snap.filepath)
+
+                iter_info = f"，SCC 迭代 {result.scc_iterations} 次" if result.scc_iterations else ""
+                save_info = f"，保存 {saved_count} 个参数" if saved_count else ""
+                st.toast(f"重算完成：{result.affected_count} 个变化{iter_info}{save_info}，快照「{snap_name}」已保存", icon="✅")
+
+                st.session_state[f"wg_{task.id}"] = working_graph
+                st.session_state[f"rr_{task.id}"] = result
+                st.session_state[f"auto_viz_{task.id}"] = True
+                save_workspace(ws)
+                st.rerun()
+
+        with act_row[3]:
+            if st.button("🔄 仅重算（不保存）", use_container_width=True):
+                if not global_pending and not (scenario and scenario.overrides):
+                    st.toast("暂无修改可应用", icon="ℹ️")
+                else:
+                    working_graph = copy.deepcopy(base_graph)
+                    with st.spinner("重算中..."):
+                        result = apply_and_recalc(working_graph, ws, base_graph)
+
+                    from datetime import datetime as _dt
+                    snap_name = f"{ws.active_scenario}_{_dt.now().strftime('%Y%m%d_%H%M%S')}"
+                    snap = create_snapshot(working_graph, task.id, snap_name)
+                    db.save_snapshot(str(uuid.uuid4())[:8], task.id, snap_name, snap.filepath)
+
+                    iter_info = f"，SCC 迭代 {result.scc_iterations} 次" if result.scc_iterations else ""
+                    st.toast(f"重算完成：{result.affected_count} 个变化{iter_info}，快照「{snap_name}」已保存", icon="✅")
+
+                    st.session_state[f"wg_{task.id}"] = working_graph
+                    st.session_state[f"rr_{task.id}"] = result
+                    st.session_state[f"auto_viz_{task.id}"] = True
+                    st.rerun()
 
                 st.session_state[f"wg_{task.id}"] = working_graph
                 st.session_state[f"rr_{task.id}"] = result
@@ -370,8 +513,25 @@ with results_col:
                         st.dataframe(irows, use_container_width=True, hide_index=True)
 
                 if recalc_result.error_cells:
-                    with st.expander(f"求值失败（{len(recalc_result.error_cells)} 个）"):
-                        st.write(recalc_result.error_cells[:50])
+                    with st.expander(f"❌ 求值失败（{len(recalc_result.error_cells)} 个）"):
+                        # Show error details with formula context
+                        err_rows = []
+                        for cid in recalc_result.error_cells[:50]:
+                            cell = working_graph.cells.get(cid)
+                            formula = ""
+                            sheet = ""
+                            if cell:
+                                formula = cell.formula or ""
+                                sheet = cell.sheet or ""
+                            err_rows.append({
+                                "Cell ID": cid,
+                                "Sheet": sheet,
+                                "公式": formula[:80] if formula else "—",
+                            })
+                        if err_rows:
+                            st.dataframe(err_rows, use_container_width=True, hide_index=True, height=200)
+                        if len(recalc_result.error_cells) > 50:
+                            st.caption(f"仅显示 50 条，共 {len(recalc_result.error_cells)} 条")
             else:
                 st.info("未找到关键指标")
         else:
