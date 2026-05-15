@@ -1,4 +1,5 @@
-"""Page 2: Interactive graph explorer — hierarchical navigation."""
+"""Page 2: Interactive graph explorer — hierarchical navigation with table views,
+time series charts, and enhanced search."""
 from __future__ import annotations
 import os
 import sys
@@ -24,10 +25,11 @@ from financial_kg.viz.echarts_graph import (
     build_indicator_graph_data,
 )
 from financial_kg.viz.echarts_template import render_graph_html
+from financial_kg.viz.qa_chart import render_time_series_html
 import json
 
 st.set_page_config(layout="wide")
-st.title("🔍 图谱浏览")
+st.title("图谱浏览")
 
 # ── Task selector ─────────────────────────────────────────────────────────────
 db = TaskDB()
@@ -51,18 +53,6 @@ def _load(task_id: str, output_dir: str):
 graph = _load(task.id, task.output_dir)
 stats = graph.stats()
 
-# ── Overview metrics ──────────────────────────────────────────────────────────
-m_cols = st.columns(6)
-m_cols[0].metric("Sheets", len(stats["sheets"]))
-m_cols[1].metric("Tables", stats["total_tables"])
-m_cols[2].metric("Indicators", stats["total_indicators"])
-m_cols[3].metric("Cells", stats["total_cells"])
-m_cols[4].metric("公式 Cells", stats["formula_cells"])
-unlinked = stats.get("unlinked_cells", 0)
-m_cols[5].metric("未关联 Table", f"{unlinked:,}", delta=f"{unlinked/stats['total_cells']*100:.1f}%" if stats["total_cells"] else "")
-
-st.divider()
-
 # ── Navigation state ──────────────────────────────────────────────────────────
 _NAV_KEY = f"nav_{task.id}"
 if _NAV_KEY not in st.session_state:
@@ -70,10 +60,27 @@ if _NAV_KEY not in st.session_state:
 
 nav = st.session_state[_NAV_KEY]
 
-# ── Render engine toggle ──────────────────────────────────────────────────────
+# ── Render engine ─────────────────────────────────────────────────────────────
 _ENGINE_KEY = f"viz_engine_{task.id}"
 if _ENGINE_KEY not in st.session_state:
     st.session_state[_ENGINE_KEY] = "echarts"
+
+# ── Top bar: task + engine + max_nodes ────────────────────────────────────────
+top_bar = st.columns([3, 2, 2])
+
+with top_bar[1]:
+    engine = st.radio(
+        "渲染引擎",
+        ["pyvis", "echarts"],
+        format_func=lambda x: "Pyvis" if x == "pyvis" else "ECharts",
+        horizontal=True,
+        index=0 if st.session_state[_ENGINE_KEY] == "pyvis" else 1,
+        label_visibility="collapsed",
+    )
+    st.session_state[_ENGINE_KEY] = engine
+
+with top_bar[2]:
+    max_nodes = st.slider("最大节点", 50, 3000, 500, 100)
 
 
 def _render_html(path: str, height: int = 640) -> None:
@@ -87,21 +94,11 @@ def _render_echarts(data: dict, height: int = 640, layout: str = "force") -> Non
 
 
 def _render_graph(pyvis_builder, data_builder, *args, height: int = 640, layout: str = "force", **kwargs):
-    engine = st.session_state[_ENGINE_KEY]
-    if engine == "pyvis":
+    eng = st.session_state[_ENGINE_KEY]
+    if eng == "pyvis":
         _render_html(pyvis_builder(*args, **kwargs), height=height)
     else:
         _render_echarts(data_builder(*args, **kwargs), height=height, layout=layout)
-
-
-def _clear_below(level: str):
-    """Clear navigation below the given level."""
-    if level == "sheet":
-        nav.update({"table": None, "indicator": None, "cell": None})
-    elif level == "table":
-        nav.update({"indicator": None, "cell": None})
-    elif level == "indicator":
-        nav["cell"] = None
 
 
 def _navigate_to(level: str, value):
@@ -117,61 +114,95 @@ def _navigate_to(level: str, value):
     st.rerun()
 
 
-# ── Sidebar ───────────────────────────────────────────────────────────────────
-st.sidebar.header("渲染引擎")
-st.session_state[_ENGINE_KEY] = st.sidebar.radio(
-    "选择渲染引擎",
-    ["pyvis", "echarts"],
-    format_func=lambda x: "Pyvis (vis.js)" if x == "pyvis" else "ECharts (可切换布局)",
-    index=0 if st.session_state[_ENGINE_KEY] == "pyvis" else 1,
-    label_visibility="collapsed",
-)
+def _highlight(text: str, query: str) -> str:
+    """Wrap query matches in **bold** markdown."""
+    if not query or not text:
+        return text
+    idx = text.lower().find(query.lower())
+    if idx < 0:
+        return text
+    return text[:idx] + "**" + text[idx:idx + len(query)] + "**" + text[idx + len(query):]
 
-st.sidebar.header("层级导航")
-max_nodes = st.sidebar.slider("最大节点数", 50, 2000, 500, 50)
 
-# Search box
+# ── Sidebar: Search + Sheet selector ──────────────────────────────────────────
 st.sidebar.header("搜索")
-search_query = st.sidebar.text_input("搜索指标名 / Cell ID / 表名", placeholder="输入关键词...")
+search_query = st.sidebar.text_input("关键词", placeholder="指标名 / Cell ID / 表名", label_visibility="collapsed")
+
+search_types = st.sidebar.multiselect(
+    "类型",
+    ["Sheet", "Table", "Indicator", "Cell"],
+    default=["Indicator", "Table", "Cell"],
+)
+search_sheets = ["(全部)"] + sorted(stats["sheets"])
+search_sheet_filter = st.sidebar.selectbox("Sheet", search_sheets)
 
 if search_query:
     q = search_query.lower()
-    # Search indicators
-    matched_inds = [ind for ind in graph.indicators.values() if q in ind.name.lower() or q in ind.id.lower()]
-    # Search tables
-    matched_tbls = [tbl for tbl in graph.tables.values() if q in tbl.name.lower() or q in tbl.id.lower()]
-    # Search cells
-    matched_cells = [c for c in graph.cells.values() if q in c.id.lower()]
+    matched = []
 
-    if matched_inds:
-        st.sidebar.caption(f"指标 ({len(matched_inds)})")
-        for ind in matched_inds[:20]:
-            label = f"{ind.name} ({ind.sheet})"
-            if st.sidebar.button(label, key=f"search_ind_{ind.id}", use_container_width=True):
-                _navigate_to("indicator", ind.id)
-        if len(matched_inds) > 20:
-            st.sidebar.caption(f"... 及其他 {len(matched_inds) - 20} 个")
+    if "Sheet" in search_types:
+        for s in stats["sheets"]:
+            if (not search_sheet_filter or search_sheet_filter == "(全部)" or s == search_sheet_filter) and q in s.lower():
+                matched.append(("Sheet", s, s))
 
-    if matched_tbls:
-        st.sidebar.caption(f"表 ({len(matched_tbls)})")
-        for tbl in matched_tbls[:20]:
-            label = f"{tbl.name} ({tbl.sheet})"
-            if st.sidebar.button(label, key=f"search_tbl_{tbl.id}", use_container_width=True):
-                _navigate_to("table", tbl.id)
-        if len(matched_tbls) > 20:
-            st.sidebar.caption(f"... 及其他 {len(matched_tbls) - 20} 个")
+    if "Table" in search_types:
+        for tbl in graph.tables.values():
+            if search_sheet_filter != "(全部)" and tbl.sheet != search_sheet_filter:
+                continue
+            if q in (tbl.name or "").lower() or q in tbl.id.lower():
+                matched.append(("Table", tbl.name, tbl.id))
 
-    if matched_cells:
-        st.sidebar.caption(f"Cell ({len(matched_cells)})")
-        for c in matched_cells[:20]:
-            short_id = c.id.split("_", 1)[-1] if "_" in c.id else c.id
-            if st.sidebar.button(short_id, key=f"search_cell_{c.id}", use_container_width=True):
-                _navigate_to("cell", c.id)
-        if len(matched_cells) > 20:
-            st.sidebar.caption(f"... 及其他 {len(matched_cells) - 20} 个")
+    if "Indicator" in search_types:
+        for ind in graph.indicators.values():
+            if search_sheet_filter != "(全部)" and ind.sheet != search_sheet_filter:
+                continue
+            if q in (ind.name or "").lower() or q in ind.id.lower():
+                matched.append(("Indicator", ind.name, ind.id))
 
-    if not matched_inds and not matched_tbls and not matched_cells:
+    if "Cell" in search_types:
+        for c in graph.cells.values():
+            if search_sheet_filter != "(全部)" and c.sheet != search_sheet_filter:
+                continue
+            if q in c.id.lower():
+                matched.append(("Cell", c.id, c.id))
+
+    st.sidebar.caption(f"结果 ({min(len(matched), 100)})")
+    for i, (typ, name, nid) in enumerate(matched[:100]):
+        hl = _highlight(name or nid, search_query)
+        label = f"[{typ}] {hl}"
+        if st.sidebar.button(label, key=f"srch_{typ}_{nid}", use_container_width=True):
+            if typ == "Sheet":
+                _navigate_to("sheet", nid)
+            elif typ == "Table":
+                tbl = graph.tables.get(nid)
+                if tbl:
+                    _navigate_to("sheet", tbl.sheet)
+                    # Need to navigate to table after sheet
+                    st.session_state[_NAV_KEY]["table"] = nid
+                    st.rerun()
+            elif typ == "Indicator":
+                ind = graph.indicators.get(nid)
+                if ind:
+                    _navigate_to("sheet", ind.sheet)
+                    st.session_state[_NAV_KEY]["table"] = ind.table_id if ind.table_id else None
+                    st.session_state[_NAV_KEY]["indicator"] = nid
+                    st.rerun()
+            elif typ == "Cell":
+                cell = graph.cells.get(nid)
+                if cell and cell.indicator_id:
+                    ind = graph.indicators.get(cell.indicator_id)
+                    if ind:
+                        _navigate_to("sheet", ind.sheet)
+                        st.session_state[_NAV_KEY]["table"] = ind.table_id if ind.table_id else None
+                        st.session_state[_NAV_KEY]["indicator"] = cell.indicator_id
+                        st.session_state[_NAV_KEY]["cell"] = nid
+                        st.rerun()
+
+    if not matched:
         st.sidebar.info("无匹配结果")
+
+st.sidebar.divider()
+st.sidebar.header("层级导航")
 
 # Sheet selector
 sheets = sorted(stats["sheets"])
@@ -184,7 +215,7 @@ if new_sheet != nav["sheet"]:
 
 if nav["sheet"]:
     tables_in_sheet = [t for t in graph.tables.values() if t.sheet == nav["sheet"]]
-    tbl_names_map = {t.name[:30]: t.id for t in tables_in_sheet}
+    tbl_names_map = {t.name[:40]: t.id for t in tables_in_sheet}
     tbl_opts = ["(选择 Table)"] + list(tbl_names_map.keys())
     tbl_idx = (list(tbl_names_map.values()).index(nav["table"]) + 1) if nav["table"] in tbl_names_map.values() else 0
     new_tbl_name = st.sidebar.selectbox("Table", tbl_opts, index=tbl_idx)
@@ -195,7 +226,7 @@ if nav["sheet"]:
 if nav["table"]:
     tbl_obj = graph.tables.get(nav["table"])
     inds_in_table = [graph.indicators[i] for i in (tbl_obj.indicator_ids if tbl_obj else []) if i in graph.indicators]
-    ind_names_map = {i.name[:30]: i.id for i in inds_in_table}
+    ind_names_map = {i.name[:40]: i.id for i in inds_in_table}
     ind_opts = ["(选择 Indicator)"] + list(ind_names_map.keys())
     ind_idx = (list(ind_names_map.values()).index(nav["indicator"]) + 1) if nav["indicator"] in ind_names_map.values() else 0
     new_ind_name = st.sidebar.selectbox("Indicator", ind_opts, index=ind_idx)
@@ -215,34 +246,46 @@ if nav["indicator"]:
     if new_cell != nav["cell"]:
         _navigate_to("cell", new_cell)
 
-# ── Main area ─────────────────────────────────────────────────────────────────
-
-# Breadcrumb
+# ── Breadcrumb (clickable to jump to level) ───────────────────────────────────
 st.subheader("导航路径")
-bc_cols = st.columns(4)
-levels = [
+bc_parts = []
+levels_data = [
     ("Sheet", nav["sheet"]),
     ("Table", nav["table"]),
     ("Indicator", nav["indicator"]),
     ("Cell", nav["cell"]),
 ]
-for i, (level_name, level_val) in enumerate(levels):
+
+# Find the deepest non-None level
+deepest = 0
+for i, (_, v) in enumerate(levels_data):
+    if v is not None:
+        deepest = i
+
+bc_cols = st.columns(4)
+for i, (level_name, level_val) in enumerate(levels_data):
     with bc_cols[i]:
-        display = level_val if level_val else f"未选择 {level_name}"
-        if level_val:
-            if st.button(display, key=f"bc_{level_name.lower()}", use_container_width=True):
-                if i == 0:
-                    _navigate_to("sheet", None)
-                elif i == 1:
-                    _navigate_to("table", None)
-                elif i == 2:
-                    _navigate_to("indicator", None)
-                elif i == 3:
-                    _navigate_to("cell", None)
+        if i <= deepest:
+            display = level_val if level_val else f"未选择 {level_name}"
+            if level_val and i < deepest:
+                if st.button(f"{level_name}: {display}", key=f"bc_{level_name.lower()}", use_container_width=True):
+                    if i == 0:
+                        nav.update({"sheet": None, "table": None, "indicator": None, "cell": None})
+                    elif i == 1:
+                        nav.update({"table": None, "indicator": None, "cell": None})
+                    elif i == 2:
+                        nav.update({"indicator": None, "cell": None})
+                    st.rerun()
+            elif i == deepest:
+                st.markdown(f"**{level_name}: {display}**")
+            else:
+                st.caption(f"{level_name}: {display}")
         else:
-            st.caption(display)
+            st.caption(f"未选择 {level_name}")
 
 st.divider()
+
+# ── Main area ─────────────────────────────────────────────────────────────────
 
 # Cell level
 if nav["cell"]:
@@ -253,6 +296,35 @@ if nav["cell"]:
     c2.metric("上游依赖", len(cell.dependencies))
     c3.metric("下游被依赖", len(cell.dependents))
     st.write(f"**公式**: `{cell.formula_raw or '无'}`")
+
+    # Upstream dependency table
+    if cell.dependencies:
+        st.subheader(f"上游依赖（{len(cell.dependencies)} 个）")
+        dep_rows = []
+        for dep_id in sorted(cell.dependencies):
+            dep_cell = graph.cells.get(dep_id)
+            dep_rows.append({
+                "Cell ID": dep_id,
+                "值": dep_cell.value if dep_cell else "—",
+                "公式": (dep_cell.formula_raw or "")[:60] if dep_cell else "",
+                "Sheet": dep_cell.sheet if dep_cell else "",
+            })
+        st.dataframe(dep_rows, use_container_width=True, hide_index=True, height=min(len(dep_rows) * 35 + 38, 300))
+
+    # Downstream dependents table
+    if cell.dependents:
+        st.subheader(f"下游被依赖（{len(cell.dependents)} 个）")
+        dpt_rows = []
+        for dpt_id in sorted(cell.dependents):
+            dpt_cell = graph.cells.get(dpt_id)
+            dpt_rows.append({
+                "Cell ID": dpt_id,
+                "值": dpt_cell.value if dpt_cell else "—",
+                "公式": (dpt_cell.formula_raw or "")[:60] if dpt_cell else "",
+                "Sheet": dpt_cell.sheet if dpt_cell else "",
+            })
+        st.dataframe(dpt_rows, use_container_width=True, hide_index=True, height=min(len(dpt_rows) * 35 + 38, 300))
+
     depth = st.slider("展开深度", 1, 5, 2)
     _render_graph(
         build_cell_subgraph, build_cell_subgraph_data,
@@ -276,21 +348,41 @@ elif nav["indicator"]:
     if ind.description:
         st.caption(ind.description)
 
+    # Time series chart
+    if ind.time_series:
+        st.subheader("时间序列")
+        html = render_time_series_html(
+            series_data=[{"name": ind.name, "values": ind.time_series}],
+            title=f"{ind.name} 趋势",
+            height="350px",
+        )
+        components.html(html, height=350)
+
+    # Cell list with navigation
     ind_obj = graph.indicators.get(nav["indicator"])
     cells_in_ind = [graph.cells[c] for c in (ind_obj.cell_ids if ind_obj else []) if c in graph.cells]
     if cells_in_ind:
         st.subheader(f"Cell 列表（{len(cells_in_ind)} 个）")
-        rows = [
-            {
+        rows = []
+        for c in cells_in_ind:
+            rows.append({
                 "ID": c.id,
                 "值": c.value,
                 "公式": c.formula_raw or "",
                 "上游依赖": len(c.dependencies),
                 "下游被依赖": len(c.dependents),
-            }
-            for c in cells_in_ind
-        ]
-        st.dataframe(rows, use_container_width=True)
+            })
+        st.dataframe(rows, use_container_width=True, hide_index=True, height=min(len(rows) * 35 + 38, 400))
+
+        # Navigation buttons for cells
+        nav_cols = st.columns(min(len(cells_in_ind), 5))
+        for j, c in enumerate(cells_in_ind[:5]):
+            with nav_cols[j % 5]:
+                short = c.id.split("_", 1)[-1] if "_" in c.id else c.id
+                if st.button(f"Cell: {short}", key=f"go_cell_{c.id}", use_container_width=True):
+                    _navigate_to("cell", c.id)
+        if len(cells_in_ind) > 5:
+            st.caption(f"... 及其他 {len(cells_in_ind) - 5} 个 Cell")
 
     _render_graph(
         build_indicator_cell_graph, build_indicator_cell_graph_data,
@@ -313,19 +405,45 @@ elif nav["table"]:
         st.subheader(f"Indicator 列表（{len(inds_in_table)} 个）")
         rows = []
         for ind in inds_in_table:
-            val_str = ind.display_value if ind.display_value is not None else (
+            val = ind.display_value if ind.display_value is not None else (
                 f"{ind.summary_value:.2f}" if isinstance(ind.summary_value, float)
                 else str(ind.summary_value or "")
             )
+            ts_len = len(ind.time_series)
+            ts_tag = f" ({ts_len}年)" if ts_len > 0 else ""
             rows.append({
                 "名称": ind.name,
                 "分类": ind.category or "",
                 "单位": ind.unit or "",
-                "汇总值": val_str,
+                "汇总值": val,
+                "时间序列": ts_tag,
                 "公式": ind.formula_readable or "",
-                "时间序列点数": len(ind.time_series),
             })
-        st.dataframe(rows, use_container_width=True)
+        st.dataframe(rows, use_container_width=True, hide_index=True, height=min(len(rows) * 35 + 38, 500))
+
+        # Navigation buttons for indicators
+        nav_cols = st.columns(min(len(inds_in_table), 5))
+        for j, ind in enumerate(inds_in_table[:5]):
+            with nav_cols[j % 5]:
+                short = ind.name[:20] if ind.name else ind.id[-20:]
+                if st.button(f"{short}", key=f"go_ind_{ind.id}", use_container_width=True):
+                    _navigate_to("indicator", ind.id)
+        if len(inds_in_table) > 5:
+            st.caption(f"... 及其他 {len(inds_in_table) - 5} 个 Indicator")
+
+        # Indicator dependency edges
+        dep_edges = []
+        for ind in inds_in_table:
+            for dep_id in ind.depends_on_indicators:
+                dep_ind = graph.indicators.get(dep_id)
+                dep_edges.append({
+                    "来源": ind.name[:30],
+                    "依赖": (dep_ind.name or dep_id)[:30] if dep_ind else dep_id[-30:],
+                    "依赖ID": dep_id,
+                })
+        if dep_edges:
+            with st.expander(f"Indicator 依赖关系（{len(dep_edges)} 条）"):
+                st.dataframe(dep_edges, use_container_width=True, hide_index=True, height=min(len(dep_edges) * 35 + 38, 300))
 
     _render_graph(
         build_indicator_subgraph, build_indicator_subgraph_data,
@@ -345,12 +463,9 @@ elif nav["sheet"]:
         rows = []
         for tbl in tables_in_sheet:
             header_rows = sorted(tbl.header_rows)
-            if not header_rows:
-                header_display = "—"
-            elif len(header_rows) == 1:
-                header_display = str(header_rows[0])
-            else:
-                header_display = f"{header_rows[0]}–{header_rows[-1]}"
+            header_display = "—"
+            if header_rows:
+                header_display = str(header_rows[0]) if len(header_rows) == 1 else f"{header_rows[0]}–{header_rows[-1]}"
             ts_cols = len(tbl.time_period_labels)
             rows.append({
                 "名称": tbl.name,
@@ -362,7 +477,31 @@ elif nav["sheet"]:
                 "上游 Table": len(tbl.fed_by),
                 "下游 Table": len(tbl.feeds_into),
             })
-        st.dataframe(rows, use_container_width=True)
+        st.dataframe(rows, use_container_width=True, hide_index=True, height=min(len(rows) * 35 + 38, 400))
+
+        # Navigation buttons for tables
+        nav_cols = st.columns(min(len(tables_in_sheet), 5))
+        for j, tbl in enumerate(tables_in_sheet[:5]):
+            with nav_cols[j % 5]:
+                short = tbl.name[:20] if tbl.name else tbl.id[-20:]
+                if st.button(f"{short}", key=f"go_tbl_{tbl.id}", use_container_width=True):
+                    _navigate_to("table", tbl.id)
+        if len(tables_in_sheet) > 5:
+            st.caption(f"... 及其他 {len(tables_in_sheet) - 5} 个 Table")
+
+        # Table dependency edges
+        tdeps = []
+        for tbl in tables_in_sheet:
+            for target_id in tbl.feeds_into:
+                t = graph.tables.get(target_id)
+                tdeps.append({
+                    "来源": tbl.name[:30],
+                    "流向": (t.name or target_id)[:30] if t else target_id[-30:],
+                    "目标Sheet": t.sheet if t else "",
+                })
+        if tdeps:
+            with st.expander(f"Table 依赖关系（{len(tdeps)} 条）"):
+                st.dataframe(tdeps, use_container_width=True, hide_index=True, height=min(len(tdeps) * 35 + 38, 250))
 
     if orphan_cells > 0:
         st.caption(f"未归属 Cell（无 Indicator）: {orphan_cells} 个")
@@ -373,22 +512,35 @@ elif nav["sheet"]:
         layout="concentric",
     )
 
-# Overview (no selection) — full graph visualization
+# Overview (no selection) — full graph + enhanced stats
 else:
     st.subheader("全量图谱概览")
-    st.caption("力导向布局，4 秒后自动冻结。拖拽可微调节点位置。")
+
+    # Truncation warning
+    total_indicators = stats["total_indicators"]
+    if max_nodes < total_indicators:
+        st.warning(f"最大节点数 {max_nodes} < 总指标数 {total_indicators}，将截断显示。")
+
     _render_echarts(
         build_indicator_graph_data(graph, max_nodes=max_nodes),
         height=800,
         layout="force",
     )
 
-    # Quick stats
     st.divider()
     st.subheader("按 Sheet 统计")
     sheet_rows = []
     for sheet_name in sorted(stats["sheets"]):
         tbl_count = sum(1 for t in graph.tables.values() if t.sheet == sheet_name)
         ind_count = sum(1 for i in graph.indicators.values() if i.sheet == sheet_name)
-        sheet_rows.append({"Sheet": sheet_name, "Table": tbl_count, "Indicator": ind_count})
-    st.dataframe(sheet_rows, use_container_width=True)
+        cell_count = sum(1 for c in graph.cells.values() if c.sheet == sheet_name)
+        formula_count = sum(1 for c in graph.cells.values() if c.sheet == sheet_name and c.formula_raw)
+        formula_pct = f"{formula_count / cell_count * 100:.0f}%" if cell_count > 0 else "—"
+        sheet_rows.append({
+            "Sheet": sheet_name,
+            "Table": tbl_count,
+            "Indicator": ind_count,
+            "Cell": cell_count,
+            "公式比例": formula_pct,
+        })
+    st.dataframe(sheet_rows, use_container_width=True, hide_index=True)
