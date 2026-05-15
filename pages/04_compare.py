@@ -188,35 +188,66 @@ with tab_kpi:
     kpi_data = build_kpi_data(diff, graph)
 
     if kpi_data:
-        # ── Layer 1: 核心变化摘要 (top 3) ──
+        # ── Layer 1: 核心变化摘要 (top 3 with full context) ──
         improved = [k for k in kpi_data if k.get("delta") is not None and k["delta"] > 0]
         declined = [k for k in kpi_data if k.get("delta") is not None and k["delta"] < 0]
-        unchanged = [k for k in kpi_data if k.get("delta") is None]
-
         abs_sorted = sorted(kpi_data, key=lambda x: abs(x.get("delta") or 0), reverse=True)
+
+        def _fmt_val(k):
+            a = k.get("value_a")
+            b = k.get("value_b")
+            a_str = f"{float(a):,.0f}" if a is not None and a != "—" else "—"
+            b_str = f"{float(b):,.0f}" if b is not None and b != "—" else "—"
+            return f"{a_str} → {b_str}"
+
+        def _fmt_delta(k):
+            d = k.get("delta")
+            p = k.get("delta_pct")
+            if d is None:
+                return None
+            s = f"{d:+,.2f}"
+            if p is not None:
+                s += f" ({p:+.1f}%)"
+            return s
 
         sm1, sm2, sm3 = st.columns(3)
 
-        best_kpi = improved[0] if improved else None
-        worst_kpi = declined[0] if declined else None
-        biggest_kpi = abs_sorted[0] if abs_sorted else None
+        # Card 1: most increased
+        if improved:
+            k = improved[0]
+            sm1.metric(
+                label=f"\U0001f4c8 增加最多: {k['name'][:15]}",
+                value=_fmt_val(k),
+                delta=_fmt_delta(k),
+            )
+        else:
+            sm1.metric("\U0001f4c8 增加最多", "无", delta="—")
 
-        if best_kpi:
-            delta_pct_str = ""
-            if best_kpi["delta_pct"] is not None:
-                delta_pct_str = f" ({best_kpi['delta_pct']:+.1f}%)"
-            sm1.metric("增加最多", f"{best_kpi['delta']:+,.2f}{delta_pct_str}")
+        # Card 2: most decreased
+        if declined:
+            k = declined[0]
+            sm2.metric(
+                label=f"\U0001f4c9 减少最多: {k['name'][:15]}",
+                value=_fmt_val(k),
+                delta=_fmt_delta(k),
+                delta_color="inverse",
+            )
+        else:
+            sm2.metric("\U0001f4c9 减少最多", "无", delta="—")
 
-        if worst_kpi:
-            delta_pct_str = ""
-            if worst_kpi["delta_pct"] is not None:
-                delta_pct_str = f" ({worst_kpi['delta_pct']:+.1f}%)"
-            sm2.metric("减少最多", f"{worst_kpi['delta']:+,.2f}{delta_pct_str}")
-
-        if biggest_kpi:
-            sm3.metric("变化幅度最大", f"|{biggest_kpi['delta']:+,.2f}|")
+        # Card 3: largest absolute change
+        if abs_sorted and abs_sorted[0].get("delta") is not None:
+            k = abs_sorted[0]
+            sm3.metric(
+                label=f"\U0001f4ca 变化最大: {k['name'][:15]}",
+                value=_fmt_val(k),
+                delta=_fmt_delta(k),
+            )
+        else:
+            sm3.metric("\U0001f4ca 变化最大", "无", delta="—")
 
         # ── Layer 2: 可排序 KPI 表格 ──
+        st.divider()
         st.subheader(f"指标明细（{len(kpi_data)} 个）")
 
         table_rows = []
