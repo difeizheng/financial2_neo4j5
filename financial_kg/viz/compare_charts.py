@@ -90,6 +90,111 @@ def build_kpi_data(
     return result
 
 
+# ── Bullet chart (KPI comparison) ────────────────────────────────────────────
+
+def render_bullet_chart_html(
+    kpi_data: list[dict],
+    snap_a_name: str = "快照 A",
+    snap_b_name: str = "快照 B",
+    height: str = "500px",
+    echarts_cdn: str = _ECHARTS_CDN,
+) -> str:
+    """ECharts bullet chart: B value as bar, A value as reference mark line."""
+    if not kpi_data:
+        return "<p style='color:#a6adc8;padding:40px;text-align:center;'>无关键指标数据</p>"
+
+    names = [k["name"][:30] for k in kpi_data]
+    values_b = []
+    values_a = []
+    deltas = []
+    for k in kpi_data:
+        try:
+            vb = float(k["value_b"]) if k["value_b"] is not None else 0
+            va = float(k["value_a"]) if k["value_a"] is not None else 0
+            values_b.append(vb)
+            values_a.append(va)
+            d = k.get("delta")
+            deltas.append(d if d is not None else 0)
+        except (ValueError, TypeError):
+            values_b.append(0)
+            values_a.append(0)
+            deltas.append(0)
+
+    names_json = json.dumps(names, ensure_ascii=False)
+    vb_json = json.dumps(values_b)
+    va_json = json.dumps(values_a)
+
+    return f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+  body {{ background: #181825; height: {height}; }}
+  #chart {{ width: 100%; height: {height}; }}
+</style>
+</head>
+<body>
+<div id="chart"></div>
+<script src="{echarts_cdn}"></script>
+<script>
+var chart = echarts.init(document.getElementById('chart'), 'dark', {{renderer: 'canvas'}});
+var names = {names_json};
+var valuesB = {vb_json};
+var valuesA = {va_json};
+
+chart.setOption({{
+  title: {{text: 'KPI 子弹图 — 柱=B值，参考线=A值', left: 'center', textStyle: {{color: '#cdd6f4', fontSize: 14}}}},
+  tooltip: {{
+    trigger: 'axis',
+    backgroundColor: '#1e1e2e',
+    borderColor: '#313244',
+    textStyle: {{color: '#cdd6f4'}},
+    formatter: function(params) {{
+      var idx = params[0].dataIndex;
+      return '<b>' + names[idx] + '</b><br/>' +
+        'A (基准): ' + valuesA[idx].toFixed(2) + '<br/>' +
+        'B (对比): ' + valuesB[idx].toFixed(2);
+    }}
+  }},
+  grid: {{left: 150, right: 30, top: 50, bottom: 10, containLabel: true}},
+  xAxis: {{type: 'value', splitLine: {{lineStyle: {{color: '#313244', type: 'dashed'}}}}, axisLabel: {{color: '#a6adc8'}}}},
+  yAxis: {{type: 'category', data: names, inverse: true, axisLabel: {{color: '#ccc', fontSize: 11}}, axisLine: {{lineStyle: {{color: '#313244'}}}}}},
+  series: [
+    {{
+      name: '{snap_b_name}',
+      type: 'bar',
+      data: valuesB.map(function(v, i) {{
+        var color = v >= valuesA[i] ? '#a6e3a1' : '#f38ba8';
+        return {{value: v, itemStyle: {{color: color}}}};
+      }}),
+      barWidth: 18
+    }},
+    {{
+      name: '{snap_a_name}',
+      type: 'scatter',
+      symbol: 'diamond',
+      symbolSize: 14,
+      symbolRotate: 90,
+      itemStyle: {{color: '#fab387'}},
+      data: valuesA.map(function(v, i) {{ return [v, i]; }})
+    }}
+  ],
+  legend: {{
+    data: ['{snap_b_name}', '{snap_a_name} (参考)'],
+    top: 30,
+    textStyle: {{color: '#a6adc8'}},
+    formatter: function(name) {{
+      return name === '{snap_a_name} (参考)' ? '◆ ' + '{snap_a_name} (参考)' : '■ ' + '{snap_b_name}';
+    }}
+  }}
+}});
+window.addEventListener('resize', function() {{ chart.resize(); }});
+</script>
+</body>
+</html>"""
+
+
 def render_kpi_dual_bar_html(
     kpi_data: list[dict],
     snap_a_name: str = "快照 A",

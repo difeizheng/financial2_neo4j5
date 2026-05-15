@@ -28,6 +28,7 @@ from financial_kg.viz.compare_viz import (
 from financial_kg.viz.compare_charts import (
     build_kpi_data,
     render_kpi_dual_bar_html,
+    render_bullet_chart_html,
     build_waterfall_data,
     render_waterfall_html,
     build_timeline_data,
@@ -153,12 +154,15 @@ def _do_diff(a_label: str, b_label: str):
 
 if st.session_state.pop("_run_auto_diff", False):
     _do_diff(st.session_state.pop("_auto_a", ""), st.session_state.pop("_auto_b", ""))
+    st.rerun()
 
 if st.session_state.pop("_run_manual_diff", False):
     _do_diff(st.session_state.pop("_manual_a", ""), st.session_state.pop("_manual_b", ""))
+    st.rerun()
 
 if st.session_state.pop("_run_swap_diff", False):
     _do_diff(st.session_state.pop("_swapped_a", ""), st.session_state.pop("_swapped_b", ""))
+    st.rerun()
 
 # ── Show diff results ─────────────────────────────────────────────────────────
 
@@ -181,59 +185,111 @@ tab_kpi, tab_impact, tab_cells, tab_heatmap, tab_prop, tab_export = st.tabs([
 # Tab 1: 关键指标
 # ══════════════════════════════════════════════════════════════════════════════
 with tab_kpi:
-    # KPI cards
     kpi_data = build_kpi_data(diff, graph)
 
     if kpi_data:
-        n_show = min(len(kpi_data), 9)
-        for ri in range((n_show + 2) // 3):
-            mc = st.columns(3)
-            for j, kpi in enumerate(kpi_data[ri * 3:(ri + 1) * 3]):
-                delta_str = None
-                if kpi["delta"] is not None:
-                    delta_str = f"{kpi['delta']:+,.2f}"
-                    if kpi["delta_pct"] is not None:
-                        delta_str += f" ({kpi['delta_pct']:+.1f}%)"
+        # ── Layer 1: 核心变化摘要 (top 3) ──
+        improved = [k for k in kpi_data if k.get("delta") is not None and k["delta"] > 0]
+        declined = [k for k in kpi_data if k.get("delta") is not None and k["delta"] < 0]
+        unchanged = [k for k in kpi_data if k.get("delta") is None]
 
-                va_display = "—"
-                vb_display = "—"
-                if kpi["value_a"] is not None:
-                    try:
-                        va_display = f"{float(kpi['value_a']):,.2f}"
-                    except (ValueError, TypeError):
-                        va_display = str(kpi["value_a"])
-                if kpi["value_b"] is not None:
-                    try:
-                        vb_display = f"{float(kpi['value_b']):,.2f}"
-                    except (ValueError, TypeError):
-                        vb_display = str(kpi["value_b"])
+        abs_sorted = sorted(kpi_data, key=lambda x: abs(x.get("delta") or 0), reverse=True)
 
-                with mc[j]:
-                    st.metric(
-                        label=kpi["name"],
-                        value=f"A: {va_display} → B: {vb_display}",
-                        delta=delta_str,
-                        delta_color="inverse" if kpi.get("delta") is not None and kpi["delta"] < 0 else "normal",
-                    )
+        sm1, sm2, sm3 = st.columns(3)
 
-        if len(kpi_data) > 9:
-            with st.expander(f"查看全部 {len(kpi_data)} 个关键指标"):
-                for kpi in kpi_data[9:]:
-                    delta_str = ""
-                    if kpi["delta"] is not None:
-                        delta_str = f"Δ {kpi['delta']:+,.2f}"
-                        if kpi["delta_pct"] is not None:
-                            delta_str += f" ({kpi['delta_pct']:+.1f}%)"
-                    st.caption(f"{kpi['name']}: A={kpi['value_a']} → B={kpi['value_b']}  {delta_str}")
+        best_kpi = improved[0] if improved else None
+        worst_kpi = declined[0] if declined else None
+        biggest_kpi = abs_sorted[0] if abs_sorted else None
 
-        # A/B dual-bar chart
-        st.divider()
-        chart_html = render_kpi_dual_bar_html(
-            kpi_data,
-            snap_a_name=diff.snapshot_a,
-            snap_b_name=diff.snapshot_b,
+        if best_kpi:
+            delta_pct_str = ""
+            if best_kpi["delta_pct"] is not None:
+                delta_pct_str = f" ({best_kpi['delta_pct']:+.1f}%)"
+            sm1.metric("增加最多", f"{best_kpi['delta']:+,.2f}{delta_pct_str}")
+
+        if worst_kpi:
+            delta_pct_str = ""
+            if worst_kpi["delta_pct"] is not None:
+                delta_pct_str = f" ({worst_kpi['delta_pct']:+.1f}%)"
+            sm2.metric("减少最多", f"{worst_kpi['delta']:+,.2f}{delta_pct_str}")
+
+        if biggest_kpi:
+            sm3.metric("变化幅度最大", f"|{biggest_kpi['delta']:+,.2f}|")
+
+        # ── Layer 2: 可排序 KPI 表格 ──
+        st.subheader(f"指标明细（{len(kpi_data)} 个）")
+
+        table_rows = []
+        for k in kpi_data:
+            delta_val = k.get("delta")
+            delta_pct_val = k.get("delta_pct")
+
+            # Status
+            if delta_val is None:
+                status = "无变化"
+            elif delta_val > 0:
+                status = "↑ 增加"
+            else:
+                status = "↓ 减少"
+
+            va_display = "—"
+            vb_display = "—"
+            if k["value_a"] is not None:
+                try:
+                    va_display = round(float(k["value_a"]), 2)
+                except (ValueError, TypeError):
+                    va_display = str(k["value_a"])
+            if k["value_b"] is not None:
+                try:
+                    vb_display = round(float(k["value_b"]), 2)
+                except (ValueError, TypeError):
+                    vb_display = str(k["value_b"])
+
+            delta_str = f"{delta_val:+,.2f}" if delta_val is not None else "—"
+            delta_pct_str = f"{delta_pct_val:+.1f}%" if delta_pct_val is not None else "—"
+
+            table_rows.append({
+                "指标": k["name"],
+                "快照A": va_display,
+                "快照B": vb_display,
+                "变化量": delta_val,
+                "变化%": delta_pct_val,
+                "状态": status,
+            })
+
+        st.dataframe(
+            table_rows,
+            use_container_width=True,
+            height=min(len(table_rows) * 35 + 40, 400),
+            hide_index=True,
+            column_config={
+                "变化%": st.column_config.ProgressColumn(
+                    "变化%",
+                    format="%.1f%%",
+                    min_value=max(min(-50, min((r["变化%"] for r in table_rows), default=-50)), -100),
+                    max_value=max(50, max((r["变化%"] for r in table_rows), default=50)),
+                ),
+            },
         )
-        components.html(chart_html, height=420, scrolling=False)
+
+        # ── Layer 3: 子弹图 ──
+        st.subheader("子弹图")
+        view_mode = st.radio("图表类型", ["子弹图", "双柱图"], horizontal=True, key="kpi_chart_mode")
+
+        if view_mode == "子弹图":
+            bullet_html = render_bullet_chart_html(
+                kpi_data,
+                snap_a_name=diff.snapshot_a,
+                snap_b_name=diff.snapshot_b,
+            )
+            components.html(bullet_html, height=500, scrolling=False)
+        else:
+            bar_html = render_kpi_dual_bar_html(
+                kpi_data,
+                snap_a_name=diff.snapshot_a,
+                snap_b_name=diff.snapshot_b,
+            )
+            components.html(bar_html, height=420, scrolling=False)
 
     else:
         st.info("未找到匹配的关键指标（NPV / IRR / 收入 / 成本等）")
