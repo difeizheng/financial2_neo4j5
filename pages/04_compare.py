@@ -257,6 +257,10 @@ with tab_kpi:
                 "状态": status,
             })
 
+        pct_vals = [r["变化%"] for r in table_rows if r["变化%"] is not None]
+        pct_min = min(pct_vals) if pct_vals else -50
+        pct_max = max(pct_vals) if pct_vals else 50
+
         st.dataframe(
             table_rows,
             use_container_width=True,
@@ -266,8 +270,8 @@ with tab_kpi:
                 "变化%": st.column_config.ProgressColumn(
                     "变化%",
                     format="%.1f%%",
-                    min_value=max(min(-50, min((r["变化%"] for r in table_rows), default=-50)), -100),
-                    max_value=max(50, max((r["变化%"] for r in table_rows), default=50)),
+                    min_value=max(pct_min, -100),
+                    max_value=max(pct_max, 50),
                 ),
             },
         )
