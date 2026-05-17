@@ -89,7 +89,7 @@ class QAEngine:
 
         try:
             resp = self._client.chat.completions.create(
-                model=self._model, messages=messages, max_tokens=1024
+                model=self._model, messages=messages, max_tokens=1024, timeout=30
             )
             answer = resp.choices[0].message.content
         except Exception as e:
@@ -180,7 +180,7 @@ class QAEngine:
 
         try:
             stream = self._client.chat.completions.create(
-                model=self._model, messages=messages, max_tokens=1024, stream=True
+                model=self._model, messages=messages, max_tokens=1024, stream=True, timeout=30
             )
             for chunk in stream:
                 if not chunk.choices:
