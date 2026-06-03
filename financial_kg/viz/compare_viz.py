@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+from functools import lru_cache
 from typing import Any
 
 from financial_kg.models.graph import FinancialGraph
@@ -15,7 +16,19 @@ def compute_change_summary(
     diff: SnapshotDiff,
     graph: FinancialGraph,
 ) -> dict:
-    """计算变更汇总统计。"""
+    """计算变更汇总统计。
+
+    Returns:
+        {
+            total_increase, total_decrease, max_magnitude, max_magnitude_cell,
+            top_indicators (count-based), sheets_ranking (count-based),
+            critical_count, normal_count,
+            # Multi-level signed-magnitude aggregations (for tornado chart)
+            sheet_contrib: {sheet: signed_magnitude_sum},
+            indicator_contrib: {indicator_name: signed_magnitude_sum},
+            category_contrib: {category: signed_magnitude_sum},
+        }
+    """
     cells = diff.changed_cells
     if not cells:
         return {
@@ -27,6 +40,9 @@ def compute_change_summary(
             "sheets_ranking": [],
             "critical_count": 0,
             "normal_count": 0,
+            "sheet_contrib": {},
+            "indicator_contrib": {},
+            "category_contrib": {},
         }
 
     increases = [c for c in cells if c.get("direction") == "increase"]
@@ -36,14 +52,14 @@ def compute_change_summary(
 
     max_cell = max(cells, key=lambda c: c.get("change_magnitude", 0))
 
-    # Sheet 变更排行
+    # Sheet 变更排行 (count-based)
     sheet_counts: dict[str, int] = {}
     for c in cells:
         sheet = c.get("sheet", "")
         sheet_counts[sheet] = sheet_counts.get(sheet, 0) + 1
     sheets_ranking = sorted(sheet_counts.items(), key=lambda x: x[1], reverse=True)
 
-    # Top 10 indicator
+    # Top 10 indicator (count-based)
     ind_counts: dict[str, int] = {}
     for c in cells:
         name = c.get("indicator_name", "") or ""
@@ -55,6 +71,32 @@ def compute_change_summary(
     critical = sum(1 for c in cells if c.get("indicator_name"))
     normal = len(cells) - critical
 
+    # Build indicator_name -> category lookup from graph (one-time)
+    name_to_category: dict[str, str] = {}
+    for ind in graph.indicators.values():
+        if ind.name and ind.category:
+            name_to_category[ind.name] = ind.category
+
+    # Multi-level signed-magnitude aggregations (for tornado)
+    sheet_contrib: dict[str, float] = {}
+    indicator_contrib: dict[str, float] = {}
+    category_contrib: dict[str, float] = {}
+    for c in cells:
+        mag = c.get("change_magnitude", 0) or 0
+        if not isinstance(mag, (int, float)):
+            continue
+        if c.get("direction") == "decrease":
+            mag = -mag
+
+        sheet = c.get("sheet", "") or "(无 Sheet)"
+        sheet_contrib[sheet] = sheet_contrib.get(sheet, 0.0) + mag
+
+        ind_name = c.get("indicator_name", "") or ""
+        if ind_name:
+            indicator_contrib[ind_name] = indicator_contrib.get(ind_name, 0.0) + mag
+            cat = name_to_category.get(ind_name, "(未分类)")
+            category_contrib[cat] = category_contrib.get(cat, 0.0) + mag
+
     return {
         "total_increase": total_increase,
         "total_decrease": total_decrease,
@@ -64,6 +106,9 @@ def compute_change_summary(
         "sheets_ranking": sheets_ranking,
         "critical_count": critical,
         "normal_count": normal,
+        "sheet_contrib": sheet_contrib,
+        "indicator_contrib": indicator_contrib,
+        "category_contrib": category_contrib,
     }
 
 

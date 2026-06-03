@@ -32,6 +32,12 @@ from financial_kg.viz.compare_charts import (
     build_waterfall_data,
     render_waterfall_html,
     build_timeline_data,
+    build_tornado_data,
+    render_tornado_html,
+    build_category_breakdown,
+    render_category_breakdown_html,
+    build_change_distribution,
+    render_change_distribution_html,
 )
 from financial_kg.viz.qa_chart import render_time_series_html
 from financial_kg.engine.excel_export import export_modified_excel, find_original_excel
@@ -146,7 +152,21 @@ def _do_diff(a_label: str, b_label: str):
         snap_a = load_snapshot(rec_a.filepath)
         snap_b = load_snapshot(rec_b.filepath)
         diff = diff_snapshots(snap_a, snap_b, graph)
+        # ── Pre-compute all expensive derivations once ──
+        # These are O(N) over 17K+ changed_cells; doing them up-front
+        # avoids re-computation on every tab switch or radio toggle.
+        all_sheets = sorted({c.get("sheet", "") for c in diff.changed_cells if c.get("sheet")})
+        cache = {
+            "all_sheets": all_sheets,
+            "kpi_data": build_kpi_data(diff, graph),
+            "summary": compute_change_summary(diff, graph),
+            "waterfall_data": build_waterfall_data(diff, graph),
+            "indicator_chart_data": build_indicator_change_chart(diff, graph),
+            "category_breakdown": build_category_breakdown(diff, graph),
+            "change_distribution": build_change_distribution(diff),
+        }
     st.session_state["diff"] = diff
+    st.session_state["diff_cache"] = cache
     st.session_state["diff_task_id"] = task.id
     st.session_state["snap_b_values"] = snap_b.values
     st.session_state.pop("prop_html", None)
@@ -181,11 +201,14 @@ tab_kpi, tab_impact, tab_cells, tab_heatmap, tab_prop, tab_export = st.tabs([
     "导出",
 ])
 
+# ── Pre-computed cache (populated by _do_diff, invalidated on new diff) ──────
+diff_cache: dict = st.session_state.get("diff_cache", {})
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Tab 1: 关键指标
 # ══════════════════════════════════════════════════════════════════════════════
 with tab_kpi:
-    kpi_data = build_kpi_data(diff, graph)
+    kpi_data = diff_cache.get("kpi_data", [])
 
     if kpi_data:
         # ── Layer 1: 核心变化摘要 (top 3 with full context) ──
@@ -212,39 +235,43 @@ with tab_kpi:
 
         sm1, sm2, sm3 = st.columns(3)
 
+        def _short_label(emoji: str, kind: str, k: dict) -> str:
+            """Two-line metric label: emoji + kind, full indicator name on second line."""
+            return f"{emoji} {kind}\n**{k['name']}**"
+
         # Card 1: most increased
         if improved:
             k = improved[0]
             sm1.metric(
-                label=f"\U0001f4c8 增加最多: {k['name'][:15]}",
+                label=_short_label("📈", "增加最多", k),
                 value=_fmt_val(k),
                 delta=_fmt_delta(k),
             )
         else:
-            sm1.metric("\U0001f4c8 增加最多", "无", delta="—")
+            sm1.metric("📈 增加最多", "无", delta="—")
 
         # Card 2: most decreased
         if declined:
             k = declined[0]
             sm2.metric(
-                label=f"\U0001f4c9 减少最多: {k['name'][:15]}",
+                label=_short_label("📉", "减少最多", k),
                 value=_fmt_val(k),
                 delta=_fmt_delta(k),
                 delta_color="inverse",
             )
         else:
-            sm2.metric("\U0001f4c9 减少最多", "无", delta="—")
+            sm2.metric("📉 减少最多", "无", delta="—")
 
         # Card 3: largest absolute change
         if abs_sorted and abs_sorted[0].get("delta") is not None:
             k = abs_sorted[0]
             sm3.metric(
-                label=f"\U0001f4ca 变化最大: {k['name'][:15]}",
+                label=_short_label("📊", "变化最大", k),
                 value=_fmt_val(k),
                 delta=_fmt_delta(k),
             )
         else:
-            sm3.metric("\U0001f4ca 变化最大", "无", delta="—")
+            sm3.metric("📊 变化最大", "无", delta="—")
 
         # ── Layer 2: 可排序 KPI 表格 ──
         st.divider()
@@ -363,20 +390,45 @@ with tab_impact:
 
     # Change summary
     if diff.changed_cells:
-        summary = compute_change_summary(diff, graph)
+        summary = diff_cache.get("summary", {})
 
         st.subheader("变更摘要")
         r1, r2, r3, r4 = st.columns(4)
-        r1.metric("总增加量", f"{summary['total_increase']:,.2f}")
-        r2.metric("总减少量", f"{summary['total_decrease']:,.2f}")
-        r3.metric("最大变化单元格", summary["max_magnitude_cell"][:30])
-        r4.metric("最大变化幅度", f"{summary['max_magnitude']:,.2f}")
+        r1.metric("总增加量", f"{summary.get('total_increase', 0):,.2f}")
+        r2.metric("总减少量", f"{summary.get('total_decrease', 0):,.2f}")
+        r3.metric("最大变化单元格", summary.get("max_magnitude_cell", "")[:30])
+        r4.metric("最大变化幅度", f"{summary.get('max_magnitude', 0):,.2f}")
 
         # Waterfall chart
         st.subheader("变化贡献瀑布图")
-        wf_data = build_waterfall_data(diff, graph)
-        wf_html = render_waterfall_html(wf_data, title=f"净变化: {wf_data['net_change']:+,.2f}")
+        wf_data = diff_cache.get("waterfall_data", {})
+        wf_html = render_waterfall_html(wf_data, title=f"净变化: {wf_data.get('net_change', 0):+,.2f}")
         components.html(wf_html, height=420, scrolling=False)
+
+        # Tornado chart — multi-level (Sheet / Indicator / Category)
+        st.subheader("变化贡献龙卷风图")
+        col_lvl, col_top = st.columns([1, 2])
+        with col_lvl:
+            tornado_level = st.radio(
+                "聚合层级",
+                ["Sheet", "Indicator", "Category"],
+                horizontal=True,
+                key="tornado_level",
+            )
+        with col_top:
+            tornado_top = st.slider("显示数量", 10, 50, 20, 5, key="tornado_top_n")
+        # Pre-aggregated maps live in cache; tornado just slices by top_n
+        tornado_data = build_tornado_data(
+            diff, graph, top_n=tornado_top, level=tornado_level,
+            precomputed=summary,
+        )
+        tornado_html = render_tornado_html(
+            tornado_data,
+            snap_a_name=diff.snapshot_a,
+            snap_b_name=diff.snapshot_b,
+            level=tornado_level,
+        )
+        components.html(tornado_html, height=420, scrolling=False)
 
         # Sheet ranking
         if summary["sheets_ranking"]:
@@ -392,15 +444,37 @@ with tab_impact:
 
         # Indicator change chart
         if st.button("查看指标变化图表", key="show_ind_chart"):
-            chart_data = build_indicator_change_chart(diff, graph)
+            chart_data = diff_cache.get("indicator_chart_data", {})
             html = render_indicator_chart_html(chart_data)
             components.html(html, height=520, scrolling=False)
+
+        # Change distribution histogram
+        st.subheader("变化幅度分布")
+        dist_data = diff_cache.get("change_distribution", {})
+        if dist_data.get("bins"):
+            dist_html = render_change_distribution_html(
+                dist_data,
+                snap_a_name=diff.snapshot_a,
+                snap_b_name=diff.snapshot_b,
+            )
+            components.html(dist_html, height=380, scrolling=False)
+
+        # Category breakdown
+        st.subheader("类别聚合")
+        cat_data = diff_cache.get("category_breakdown", {})
+        if cat_data.get("items"):
+            cat_html = render_category_breakdown_html(
+                cat_data,
+                snap_a_name=diff.snapshot_a,
+                snap_b_name=diff.snapshot_b,
+            )
+            components.html(cat_html, height=420, scrolling=False)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Tab 3: 变化明细
 # ══════════════════════════════════════════════════════════════════════════════
 with tab_cells:
-    all_sheets = sorted({c.get("sheet", "") for c in diff.changed_cells if c.get("sheet")})
+    all_sheets = diff_cache.get("all_sheets", [])
 
     st.caption(f"共 {len(diff.changed_cells)} 条变化")
 
@@ -451,15 +525,15 @@ with tab_heatmap:
     view_mode = st.radio("视图模式", ["指标聚合图", "单元格热力图"], horizontal=True)
 
     if view_mode == "指标聚合图":
-        chart_data = build_indicator_change_chart(diff, graph)
-        if chart_data["items"]:
+        chart_data = diff_cache.get("indicator_chart_data", {})
+        if chart_data.get("items"):
             html = render_indicator_chart_html(chart_data)
             components.html(html, height=520, scrolling=False)
         else:
             st.info("无关联 indicator 的变化单元格")
 
     else:
-        sheets = sorted({c.get("sheet", "") for c in diff.changed_cells if c.get("sheet")})
+        sheets = diff_cache.get("all_sheets", [])
         selected_sheet = st.selectbox("选择 Sheet", sheets)
         if selected_sheet:
             hdata = build_heatmap_data(graph, diff, sheet_name=selected_sheet)

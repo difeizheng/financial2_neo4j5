@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from functools import lru_cache
 from typing import Any
 
 from financial_kg.models.graph import FinancialGraph
@@ -428,7 +429,547 @@ window.addEventListener('resize', function() {{ chart.resize(); }});
 </html>"""
 
 
+# ── Tornado chart ─────────────────────────────────────────────────────────────
+
+_LEVEL_TO_KEY = {
+    "Sheet": "sheet_contrib",
+    "Indicator": "indicator_contrib",
+    "Category": "category_contrib",
+}
+
+
+def build_tornado_data(
+    diff: SnapshotDiff,
+    graph: FinancialGraph,
+    top_n: int = 30,
+    level: str = "Sheet",
+    precomputed: dict | None = None,
+) -> dict:
+    """Build tornado (diverging bar) data: top N items by |delta|, split +/−.
+
+    Args:
+        diff: snapshot diff (used as fallback if precomputed absent)
+        graph: financial graph
+        top_n: number of top items to display
+        level: aggregation level — "Sheet" | "Indicator" | "Category"
+        precomputed: summary dict from compute_change_summary, with
+            sheet_contrib / indicator_contrib / category_contrib fields.
+            When provided, aggregation is O(N) once at diff time (cached).
+            When None, falls back to recomputing from diff.changed_cells.
+
+    Returns:
+        {
+            items: [{name, value}],
+            all_names, all_pos_values, all_neg_values,
+        }
+    """
+    contrib: dict[str, float] = {}
+    if precomputed and level in _LEVEL_TO_KEY:
+        contrib = precomputed.get(_LEVEL_TO_KEY[level], {}) or {}
+    else:
+        # Fallback: recompute from cells (only Sheet level for compatibility)
+        for cell in diff.changed_cells:
+            sheet = cell.get("sheet", "(无 Sheet)")
+            mag = cell.get("change_magnitude", 0) or 0
+            if not isinstance(mag, (int, float)):
+                continue
+            if cell.get("direction") == "decrease":
+                mag = -mag
+            contrib[sheet] = contrib.get(sheet, 0.0) + mag
+
+    # Sort by absolute contribution, take top N
+    sorted_items = sorted(contrib.items(), key=lambda x: abs(x[1]), reverse=True)[:top_n]
+
+    # Truncate indicator names for axis labels (full name in tooltip)
+    display_names = [n[:25] + "…" if len(n) > 25 else n for n, _ in sorted_items]
+    pos_values = [round(v, 2) if v >= 0 else 0 for _, v in sorted_items]
+    neg_values = [round(-v, 2) if v < 0 else 0 for _, v in sorted_items]
+    full_names = [n for n, _ in sorted_items]
+
+    return {
+        "items": [{"name": n, "value": round(v, 2)} for n, v in sorted_items],
+        "all_names": display_names,
+        "all_pos_values": pos_values,
+        "all_neg_values": neg_values,
+        "full_names": full_names,
+    }
+
+
+def render_tornado_html(
+    tornado_data: dict,
+    title: str = "变化贡献龙卷风图",
+    snap_a_name: str = "基准",
+    snap_b_name: str = "对比",
+    level: str = "Sheet",
+    height: str = "420px",
+    echarts_cdn: str = _ECHARTS_CDN,
+) -> str:
+    """ECharts tornado (diverging bar) chart. Positive bars right, negative left.
+
+    Uses display names (truncated) for axis labels and full names in tooltip.
+    """
+    names = tornado_data.get("all_names", [])
+    pos_values = tornado_data.get("all_pos_values", [])
+    neg_values = tornado_data.get("all_neg_values", [])
+    full_names = tornado_data.get("full_names", names)
+
+    if not names:
+        return "<p style='color:#a6adc8;padding:40px;text-align:center;'>无变化数据</p>"
+
+    names_json = json.dumps(names, ensure_ascii=False)
+    full_names_json = json.dumps(full_names, ensure_ascii=False)
+    pos_json = json.dumps(pos_values)
+    neg_json = json.dumps(neg_values)
+    full_title = f"{title} (按{level})"
+
+    return f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+  body {{ background: #181825; height: {height}; }}
+  #chart {{ width: 100%; height: {height}; }}
+</style>
+</head>
+<body>
+<div id="chart"></div>
+<script src="{echarts_cdn}"></script>
+<script>
+var chart = echarts.init(document.getElementById('chart'), 'dark', {{renderer: 'canvas'}});
+var names = {names_json};
+var fullNames = {full_names_json};
+var pos = {pos_json};
+var neg = {neg_json};
+
+chart.setOption({{
+  title: {{text: '{full_title}', left: 'center', textStyle: {{color: '#cdd6f4', fontSize: 14}}}},
+  tooltip: {{
+    trigger: 'axis',
+    backgroundColor: '#1e1e2e',
+    borderColor: '#313244',
+    textStyle: {{color: '#cdd6f4'}},
+    formatter: function(params) {{
+      var idx = params[0].dataIndex;
+      var p = pos[idx];
+      var n = neg[idx];
+      var lines = ['<b>' + fullNames[idx] + '</b>'];
+      if (p > 0) lines.push('↑ 增加: +' + p.toFixed(2));
+      if (n > 0) lines.push('↓ 减少: -' + n.toFixed(2));
+      var net = p - n;
+      lines.push('净变化: ' + (net >= 0 ? '+' : '') + net.toFixed(2));
+      return lines.join('<br/>');
+    }}
+  }},
+  legend: {{data: ['增加', '减少'], top: 30, textStyle: {{color: '#a6adc8'}}}},
+  grid: [
+    {{left: 10, right: '50%', top: 50, bottom: 20}},
+    {{left: '50%', right: 10, top: 50, bottom: 20}}
+  ],
+  xAxis: [
+    {{
+      gridIndex: 0, type: 'value', inverse: true,
+      axisLabel: {{show: false}},
+      splitLine: {{lineStyle: {{color: '#313244', type: 'dashed'}}}},
+      axisLine: {{lineStyle: {{color: '#313244'}}}}
+    }},
+    {{
+      gridIndex: 1, type: 'value',
+      axisLabel: {{show: false}},
+      splitLine: {{lineStyle: {{color: '#313244', type: 'dashed'}}}},
+      axisLine: {{lineStyle: {{color: '#313244'}}}}
+    }}
+  ],
+  yAxis: [
+    {{
+      gridIndex: 0, type: 'category', inverse: true,
+      data: names,
+      axisLabel: {{color: '#ccc', fontSize: 11}},
+      axisLine: {{lineStyle: {{color: '#313244'}}}},
+      axisTick: {{show: false}}
+    }},
+    {{
+      gridIndex: 1, type: 'category', inverse: true,
+      data: names,
+      axisLabel: {{show: false}},
+      axisLine: {{lineStyle: {{color: '#313244'}}}},
+      axisTick: {{show: false}}
+    }}
+  ],
+  series: [
+    {{
+      name: '减少', type: 'bar', xAxisIndex: 0, yAxisIndex: 0,
+      data: neg.map(function(v) {{ return {{value: v, itemStyle: {{color: '#f38ba8'}}}}; }}),
+      barWidth: '60%', label: {{show: true, position: 'left', color: '#f38ba8', fontSize: 10}}
+    }},
+    {{
+      name: '增加', type: 'bar', xAxisIndex: 1, yAxisIndex: 1,
+      data: pos.map(function(v) {{ return {{value: v, itemStyle: {{color: '#a6e3a1'}}}}; }}),
+      barWidth: '60%', label: {{show: true, position: 'right', color: '#a6e3a1', fontSize: 10}}
+    }}
+  ],
+  dataZoom: [
+    {{type: 'slider', yAxisIndex: 0, right: 2, top: 50, bottom: 20, width: 8, show: true}},
+    {{type: 'inside', yAxisIndex: 0}}
+  ]
+}});
+window.addEventListener('resize', function() {{ chart.resize(); }});
+</script>
+</body>
+</html>"""
+
+
+# ── Change distribution histogram ────────────────────────────────────────────
+
+def build_change_distribution(
+    diff: SnapshotDiff,
+    bin_count: int = 10,
+) -> dict:
+    """Build histogram of |change_magnitude| over all changed cells.
+
+    Log-scale bins (each bin is 10x the previous) handle the heavy-tailed
+    distribution typical in financial models (a few huge changes, many small).
+
+    Returns:
+        {
+            bins: [{label, lo, hi, count}],
+            total_cells, total_log_sum,
+            min_mag, max_mag, median_mag,
+        }
+    """
+    import math
+
+    magnitudes: list[float] = []
+    for c in diff.changed_cells:
+        mag = c.get("change_magnitude", 0)
+        if isinstance(mag, (int, float)) and mag > 0:
+            magnitudes.append(float(mag))
+
+    if not magnitudes:
+        return {"bins": [], "total_cells": 0, "min_mag": 0, "max_mag": 0, "median_mag": 0}
+
+    magnitudes.sort()
+    min_mag = magnitudes[0]
+    max_mag = magnitudes[-1]
+    median_mag = magnitudes[len(magnitudes) // 2]
+
+    # Log-scale bins from 10^floor(log10(min)) to 10^ceil(log10(max))
+    log_min = math.floor(math.log10(min_mag))
+    log_max = math.ceil(math.log10(max_mag))
+    if log_max <= log_min:
+        log_max = log_min + 1
+
+    bins = []
+    for i in range(log_min, log_max):
+        lo = 10 ** i
+        hi = 10 ** (i + 1)
+        if i == log_min:
+            count = sum(1 for m in magnitudes if lo <= m < hi)
+        elif i == log_max - 1:
+            count = sum(1 for m in magnitudes if lo <= m <= hi)
+        else:
+            count = sum(1 for m in magnitudes if lo <= m < hi)
+        if count > 0:
+            bins.append({
+                "label": f"10^{i}",
+                "lo": lo,
+                "hi": hi,
+                "count": count,
+            })
+
+    return {
+        "bins": bins,
+        "total_cells": len(magnitudes),
+        "min_mag": min_mag,
+        "max_mag": max_mag,
+        "median_mag": median_mag,
+    }
+
+
+def render_change_distribution_html(
+    dist_data: dict,
+    snap_a_name: str = "基准",
+    snap_b_name: str = "对比",
+    height: str = "380px",
+    echarts_cdn: str = _ECHARTS_CDN,
+) -> str:
+    """ECharts log-scale histogram of change magnitudes."""
+    bins = dist_data.get("bins", [])
+    if not bins:
+        return "<p style='color:#a6adc8;padding:40px;text-align:center;'>无数值型变化</p>"
+
+    labels = [b["label"] for b in bins]
+    counts = [b["count"] for b in bins]
+    labels_json = json.dumps(labels)
+    counts_json = json.dumps(counts)
+
+    median = dist_data.get("median_mag", 0)
+    total = dist_data.get("total_cells", 0)
+    subtitle = f"共 {total:,} 个变化单元格 · 中位数 {median:.2f}"
+
+    return f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+  body {{ background: #181825; height: {height}; }}
+  #chart {{ width: 100%; height: {height}; }}
+</style>
+</head>
+<body>
+<div id="chart"></div>
+<script src="{echarts_cdn}"></script>
+<script>
+var chart = echarts.init(document.getElementById('chart'), 'dark', {{renderer: 'canvas'}});
+var labels = {labels_json};
+var counts = {counts_json};
+
+chart.setOption({{
+  title: {{
+    text: '变化幅度分布（对数刻度）',
+    subtext: '{subtitle}',
+    left: 'center',
+    textStyle: {{color: '#cdd6f4', fontSize: 14}},
+    subtextStyle: {{color: '#a6adc8', fontSize: 11}}
+  }},
+  tooltip: {{
+    trigger: 'axis',
+    backgroundColor: '#1e1e2e',
+    borderColor: '#313244',
+    textStyle: {{color: '#cdd6f4'}},
+    formatter: function(params) {{
+      var idx = params[0].dataIndex;
+      return '<b>' + labels[idx] + '</b><br/>' +
+        '区间: [' + Math.pow(10, idx) + ', ' + Math.pow(10, idx + 1) + ')<br/>' +
+        '单元格数: ' + counts[idx];
+    }}
+  }},
+  grid: {{left: 60, right: 30, top: 70, bottom: 40}},
+  xAxis: {{
+    type: 'category', data: labels,
+    axisLabel: {{color: '#a6adc8'}},
+    axisLine: {{lineStyle: {{color: '#313244'}}}}
+  }},
+  yAxis: {{
+    type: 'value', name: '单元格数',
+    nameTextStyle: {{color: '#a6adc8'}},
+    axisLabel: {{color: '#a6adc8'}},
+    splitLine: {{lineStyle: {{color: '#313244', type: 'dashed'}}}}
+  }},
+  series: [{{
+    type: 'bar',
+    data: counts.map(function(v) {{
+      return {{value: v, itemStyle: {{
+        color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
+          {{offset: 0, color: '#89b4fa'}}, {{offset: 1, color: '#45475a'}}
+        ])
+      }}}};
+    }}),
+    barWidth: '70%',
+    label: {{show: true, position: 'top', color: '#cdd6f4', fontSize: 11}}
+  }}]
+}});
+window.addEventListener('resize', function() {{ chart.resize(); }});
+</script>
+</body>
+</html>"""
+
+
+# ── Category breakdown ────────────────────────────────────────────────────────
+
+def build_category_breakdown(
+    diff: SnapshotDiff,
+    graph: FinancialGraph,
+) -> dict:
+    """Aggregate change_magnitude by indicator.category.
+
+    Returns:
+        {
+            items: [{category, increase, decrease, net, cell_count}],
+        }
+    """
+    # Build indicator_name -> category lookup
+    name_to_category: dict[str, str] = {}
+    for ind in graph.indicators.values():
+        if ind.name and ind.category:
+            name_to_category[ind.name] = ind.category
+
+    by_cat: dict[str, dict] = {}
+    for c in diff.changed_cells:
+        cat = "(无 Indicator)"
+        ind_name = c.get("indicator_name", "") or ""
+        if ind_name:
+            cat = name_to_category.get(ind_name, "(未分类)")
+        if cat not in by_cat:
+            by_cat[cat] = {"category": cat, "increase": 0.0, "decrease": 0.0, "cell_count": 0}
+        mag = c.get("change_magnitude", 0) or 0
+        if not isinstance(mag, (int, float)):
+            mag = 0
+        direction = c.get("direction", "")
+        if direction == "increase":
+            by_cat[cat]["increase"] += mag
+        elif direction == "decrease":
+            by_cat[cat]["decrease"] += mag
+        by_cat[cat]["cell_count"] += 1
+
+    items = []
+    for v in by_cat.values():
+        v["net"] = v["increase"] - v["decrease"]
+        v["increase"] = round(v["increase"], 2)
+        v["decrease"] = round(v["decrease"], 2)
+        v["net"] = round(v["net"], 2)
+        items.append(v)
+
+    # Sort by absolute net change
+    items.sort(key=lambda x: abs(x["net"]), reverse=True)
+    return {"items": items}
+
+
+def render_category_breakdown_html(
+    cat_data: dict,
+    snap_a_name: str = "基准",
+    snap_b_name: str = "对比",
+    height: str = "420px",
+    echarts_cdn: str = _ECHARTS_CDN,
+) -> str:
+    """ECharts horizontal stacked bar: per-category increase vs decrease."""
+    items = cat_data.get("items", [])
+    if not items:
+        return "<p style='color:#a6adc8;padding:40px;text-align:center;'>无类别聚合数据</p>"
+
+    # Display truncated names; full names in tooltip
+    names = [i["category"][:18] + "…" if len(i["category"]) > 18 else i["category"] for i in items]
+    full_names = [i["category"] for i in items]
+    increases = [i["increase"] for i in items]
+    decreases = [i["decrease"] for i in items]
+    nets = [i["net"] for i in items]
+    counts = [i["cell_count"] for i in items]
+
+    names_json = json.dumps(names, ensure_ascii=False)
+    full_names_json = json.dumps(full_names, ensure_ascii=False)
+    inc_json = json.dumps(increases)
+    dec_json = json.dumps(decreases)
+    net_json = json.dumps(nets)
+    counts_json = json.dumps(counts)
+
+    return f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+  body {{ background: #181825; height: {height}; }}
+  #chart {{ width: 100%; height: {height}; }}
+</style>
+</head>
+<body>
+<div id="chart"></div>
+<script src="{echarts_cdn}"></script>
+<script>
+var chart = echarts.init(document.getElementById('chart'), 'dark', {{renderer: 'canvas'}});
+var names = {names_json};
+var fullNames = {full_names_json};
+var incs = {inc_json};
+var decs = {dec_json};
+var nets = {net_json};
+var counts = {counts_json};
+
+chart.setOption({{
+  title: {{text: '按类别聚合变化', left: 'center', textStyle: {{color: '#cdd6f4', fontSize: 14}}}},
+  tooltip: {{
+    trigger: 'axis',
+    backgroundColor: '#1e1e2e',
+    borderColor: '#313244',
+    textStyle: {{color: '#cdd6f4'}},
+    formatter: function(params) {{
+      var idx = params[0].dataIndex;
+      var lines = ['<b>' + fullNames[idx] + '</b>',
+        '↑ 增加: +' + incs[idx].toFixed(2),
+        '↓ 减少: -' + decs[idx].toFixed(2),
+        '净变化: ' + (nets[idx] >= 0 ? '+' : '') + nets[idx].toFixed(2),
+        '单元格数: ' + counts[idx]];
+      return lines.join('<br/>');
+    }}
+  }},
+  legend: {{data: ['增加', '减少'], top: 30, textStyle: {{color: '#a6adc8'}}}},
+  grid: {{left: 10, right: 60, top: 70, bottom: 20}},
+  xAxis: {{
+    type: 'value',
+    axisLabel: {{color: '#a6adc8'}},
+    splitLine: {{lineStyle: {{color: '#313244', type: 'dashed'}}}}
+  }},
+  yAxis: {{
+    type: 'category', inverse: true,
+    data: names,
+    axisLabel: {{color: '#ccc', fontSize: 11}},
+    axisLine: {{lineStyle: {{color: '#313244'}}}}
+  }},
+  series: [
+    {{
+      name: '减少', type: 'bar',
+      data: decs.map(function(v) {{ return {{value: -v, itemStyle: {{color: '#f38ba8'}}}}; }}),
+      barWidth: '50%',
+      label: {{
+        show: true, position: 'left', color: '#f38ba8', fontSize: 10,
+        formatter: function(p) {{ return p.value < 0 ? p.value.toFixed(0) : ''; }}
+      }}
+    }},
+    {{
+      name: '增加', type: 'bar',
+      data: incs.map(function(v) {{ return {{value: v, itemStyle: {{color: '#a6e3a1'}}}}; }}),
+      barWidth: '50%',
+      label: {{
+        show: true, position: 'right', color: '#a6e3a1', fontSize: 10,
+        formatter: function(p) {{ return p.value > 0 ? '+' + p.value.toFixed(0) : ''; }}
+      }}
+    }}
+  ],
+  dataZoom: [
+    {{type: 'slider', yAxisIndex: 0, right: 2, top: 70, bottom: 20, width: 8, show: true}},
+    {{type: 'inside', yAxisIndex: 0}}
+  ]
+}});
+window.addEventListener('resize', function() {{ chart.resize(); }});
+</script>
+</body>
+</html>"""
+
+
 # ── Multi-snapshot timeline data builder ──────────────────────────────────────
+
+@lru_cache(maxsize=4)
+def _build_timeline_data_cached(
+    snap_filepaths: tuple[str, ...],
+    snap_names: tuple[str, ...],
+    kpi_info: tuple[tuple[str, str, tuple[str, ...]], ...],  # (ind_id, name, cell_ids)
+) -> list[dict]:
+    """Cached timeline builder — all args must be hashable.
+
+    kpi_info: tuple of (ind_id, name, cell_ids) for each KPI indicator.
+    """
+    from financial_kg.engine.snapshot import load_snapshot
+
+    result = []
+    for ind_id, name, cell_ids in kpi_info:
+        values = {}
+        for i, fp in enumerate(snap_filepaths):
+            try:
+                snap_obj = load_snapshot(fp)
+                for cid in cell_ids[:5]:
+                    v = snap_obj.values.get(cid)
+                    if v is not None:
+                        try:
+                            values[snap_names[i]] = float(v)
+                            break
+                        except (ValueError, TypeError):
+                            continue
+            except Exception:
+                continue
+        if len(values) >= 2:
+            result.append({"name": name, "values": values})
+    return result
+
 
 def build_timeline_data(
     snapshots: list,
@@ -440,42 +981,46 @@ def build_timeline_data(
     Returns: [{name: str, values: {snapshot_label: value}}, ...]
     """
     kpi_ids = get_key_metrics(graph)
+    if not kpi_ids or not snapshots:
+        return []
 
-    result = []
-    for ind_id in kpi_ids:
-        ind = graph.indicators.get(ind_id)
-        if not ind:
-            continue
-        name = ind.name or ind_id
+    snap_filepaths = tuple(s.filepath for s in snapshots)
+    snap_names = tuple(s.name for s in snapshots)
+    kpi_info = []
+    for kid in kpi_ids:
+        ind = graph.indicators.get(kid)
+        if ind:
+            kpi_info.append((kid, ind.name or kid, tuple(ind.cell_ids)))
 
-        # For each snapshot, try to find the indicator's value
-        values = {}
-        for snap in snapshots:
-            # Try to load snapshot and extract value for this indicator
-            snap_obj = _load_snapshot_safe(snap)
-            if snap_obj is None:
+    try:
+        return _build_timeline_data_cached(snap_filepaths, snap_names, tuple(kpi_info))
+    except Exception:
+        # Fallback: uncached
+        result = []
+        for ind_id in kpi_ids:
+            ind = graph.indicators.get(ind_id)
+            if not ind:
                 continue
-
-            # Find the indicator's value_cell_id or first cell_id
-            for cid in ind.cell_ids[:5]:
-                if cid in snap_obj.values:
-                    v = snap_obj.values[cid]
+            name = ind.name or ind_id
+            values = {}
+            for snap in snapshots:
+                snap_obj = _load_snapshot_safe(snap)
+                if snap_obj is None:
+                    continue
+                for cid in ind.cell_ids[:5]:
+                    v = snap_obj.values.get(cid)
                     if v is not None:
                         try:
                             values[snap.name] = float(v)
                             break
                         except (ValueError, TypeError):
                             continue
-
-            # Fallback: use indicator summary_value
-            if snap.name not in values:
-                if ind.summary_value is not None:
-                    values[snap.name] = ind.summary_value
-
-        if len(values) >= 2:
-            result.append({"name": name, "values": values})
-
-    return result
+                if snap.name not in values:
+                    if ind.summary_value is not None:
+                        values[snap.name] = ind.summary_value
+            if len(values) >= 2:
+                result.append({"name": name, "values": values})
+        return result
 
 
 def _load_snapshot_safe(snap_record):
